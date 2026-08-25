@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # 發布 radar（開發端 → STANDARD/radar）。
 #
-# 版本標記：main.py 會在上傳前自動執行 radar/tools/stamp_version.py 產生 VERSION.stamp.json
+# 版本標記：main.py 一看到 radar 根目錄有 VERSION.json，就會在上傳前產生 VERSION.stamp.json
 # （船上沒有 .git，算不出自己是哪個 commit，所以只能在發布端產生），並把版本字串填進
-# log CSV 的 version_info 欄 —— 見 main.py 的 _apply_version_stamp。
+# log CSV 的 version_info 欄 —— 見 version_stamp.py。
 # 因此不論走這支、run_all_uploads.py、run_selected_transfers.py 還是手動
 # `main.py --cli --mode upload --config config/radar_upload_settings.json`，
 # 都會帶上版本標記；這支只是慣例上的具名入口（比照 run_share_upload.sh）。
+# radar repo 裡不需要任何腳本 —— 有 VERSION.json 就夠了。
 # 例外：GUI 不走 run_cli，不會產生版本標記 —— radar 不以 GUI 發布，用了船上會顯示 files:UNSTAMPED。
 set -euo pipefail
 

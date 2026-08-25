@@ -359,26 +359,44 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 
 畫面／終端機顯示的仍是易讀文字，但本地儲存的 log 檔（`logs/` 資料夾內、副檔名 `.csv`）是 **CSV 格式**，欄位為 `timestamp, device_name, version_info, level, message`（`version_info` 為選填欄位，未填則該欄位為空），可直接用 Excel 開啟；若把上百台裝置的 log 檔集中到同一資料夾，可直接合併成一份總表，用「裝置名稱」或「版號」欄位篩選、用「時間」排序即可彙整查看所有裝置的下載狀況。
 
-### radar 的 version_info（程式碼版本）
+### 版本標記（`VERSION.json` → `VERSION.stamp.json`）
 
-`radar` 這個專案的 `version_info` 不填在設定檔裡，而是由 run script 在執行時從 radar 自己的版本標記檔取出、以 `--version-info` 傳入：
+`main.py` 的 `run_cli()` 會檢查待傳輸專案（`local_path`）的**根目錄有沒有 `VERSION.json`**：
 
-`main.py` 的 `run_cli()` 會檢查待傳輸目錄（`local_path`）底下有沒有 `tools/stamp_version.py`：
+- **有**（目前只有 radar）：
+  - **上傳**：先產生 `<專案>/VERSION.stamp.json` —— 內容是宣告的版號 + git commit/branch/dirty + **每個會上傳的檔案的 sha256**；接著在呼叫端沒有明確指定 `--version-info` 時，把版本字串（例如 `0.4.0+8154418`）填進 log 的 `version_info` 欄。
+  - **下載**：只讀不寫，取到的是「下載前」的版本 —— 那正是要記進 log 的。
+- **沒有**：完全照舊，一行都不會執行。
 
-- **有**（目前只有 radar）：上傳前先執行它產生 `radar/VERSION.stamp.json`（人工宣告於 `radar/VERSION.json` 的版號 + git commit/branch/dirty + 每個檔的 sha256）；接著以 `--print` 取得版本字串，在呼叫端沒有明確指定 `--version-info` 時填進 log 的 `version_info` 欄。下載時只讀不寫，取到的是「下載前」的版本。
-- **沒有**：完全照舊，其他專案不受影響。
+**要讓一個新專案獲得這項功能，只要在它的根目錄放一個 `VERSION.json`**，專案裡不需要放任何腳本：
 
-這是一個約定，任何專案只要放一支支援「無參數 = 產生標記、`--print` = 印單行版本」的 `tools/stamp_version.py` 就能沿用。
+```json
+{
+  "version": "1.4.0",
+  "date": "2026-08-25",
+  "notes": "這一版改了什麼",
+  "stamp_exclude": ["wheels/", "models/"]
+}
+```
 
-放在 `run_cli()` 而不是某支 `run_*.sh` 的理由：發布與更新有很多條路（`run_all_uploads.py`、`run_selected_transfers.py`、`run_radar_*.sh`、手動 `main.py --cli`），`run_cli()` 是它們共同的收口；只在單一腳本裡處理的話，換一條路走就靜默失去版本資訊。
+- `version` 必填、不可含空白（它要進 log CSV 與 shell 變數）。`date` / `notes` 選填。
+- `stamp_exclude`（gitignore 語法，選填）：宣告「會上傳、但不算程式碼身分」的路徑。典型是**安裝期產物**（radar 的 `wheels/`、`YOLOv7_MODEL/` 合計約 780 MB —— 列進 manifest 會讓船上每次開機的驗證重讀好幾百 MB）與**內容由別的元件覆寫的檔**（列進去只會永遠 mismatch）。
+- 版號要升就只改 `VERSION.json`，程式碼一行都不用動。`VERSION.stamp.json` 是產物，請在該專案的 `.gitignore` 排除它。
+- 若 `version` 沒動、但檔案內容與上次標記不同，stamp 會警告「忘了升版？」——警告但不中止，緊急發布不該被擋住。
+
+**manifest 就是「這次真正會上傳的檔案」**：`version_stamp.py` 直接沿用 `pack_upload.build_archive_plan()`，也就是 `SFTPUploader` 的選檔邏輯加上同一份 `ignore_file`。所以不存在「第二份排除清單要跟 upload ignore 同步」的問題。
+
+**為什麼掛在 `run_cli()`** 而不是某支 `run_*.sh`：發布與更新有很多條路（`run_all_uploads.py`、`run_selected_transfers.py`、`run_radar_*.sh`、手動 `main.py --cli`），`run_cli()` 是它們共同的收口；只在單一腳本裡處理，換一條路走就靜默失去版本資訊。
+
+其餘相關：
 
 - 船上沒有 `.git`，所以版本標記只能在發布端產生 —— 這也是「上傳前」而非上傳後的原因。
 - 下載 log 依 `log_remote_dir` 自動上傳到岸端 `sftp_logs/download/{vsl_name}/{ipc}/radar`，用 `monitor/tui.py` 開該筆 log 即可看到版本 —— 這是岸端逐船確認 OTA 版本最快的路。
 - 「下載後」的版本由 scheduler 的 `reboot_script/start_radar.sh` 在 update 相位前後各印一行到 launcher.log（開機與每日 `nssms-warm-env` 都走這條）；兩行相同就代表這次沒有換版。
 
-> **GUI 例外**：GUI 不走 `run_cli()`（它自己呼叫 `create_logger` / `SFTPUploader`），所以 GUI 上傳不會產生版本標記。radar 不以 GUI 發布；真要用的話請先手動執行一次 `radar/tools/stamp_version.py`，否則船上會顯示 `files:UNSTAMPED`。
+> **GUI 例外**：GUI 不走 `run_cli()`（它自己呼叫 `create_logger` / `SFTPUploader`），所以 GUI 上傳不會產生版本標記；船上會顯示 `files:UNSTAMPED`。radar 不以 GUI 發布。
 >
-> 設定檔裡的 `version_info` 欄位對 radar 留空即可 —— `config/` 是 gitignored 且會被岸端 STANDARD 覆寫，填死在那裡的字串無法隨程式版本一起變。
+> 設定檔裡的 `version_info` 欄位留空即可 —— `config/` 是 gitignored 且會被岸端 STANDARD 覆寫，填死在那裡的字串無法隨程式版本一起變。
 
 ---
 

@@ -30,8 +30,8 @@ if [[ ! -x "$VENV_PY" ]]; then
     exit 1
 fi
 
-# 版本資訊不在這裡取：main.py 會偵測待傳輸目錄裡的 tools/stamp_version.py，把「下載前」
-# 的 radar 版本填進 log CSV 的 version_info 欄（見 main.py 的 _apply_version_stamp）。
+# 版本資訊不在這裡取：main.py 一看到 radar 根目錄有 VERSION.json，就會把「下載前」的
+# radar 版本填進 log CSV 的 version_info 欄（見 version_stamp.py）。
 # 放在 main.py 是因為下載也可能走 run_all_downloads.py / run_selected_transfers.py，
 # 只在這支腳本裡取的話換條路就靜默失去版本資訊。
 "$VENV_PY" "$BASE_DIR/main.py" --cli --config "$config"
