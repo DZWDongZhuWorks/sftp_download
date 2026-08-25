@@ -42,6 +42,19 @@ SFTP_RETRY_EXCEPTIONS = (
 _FILENAME_UNSAFE = re.compile(r'[<>:"/\\|?*]')
 
 
+class TransferCancelled(BaseException):
+    """外部要求傳輸乾淨收尾（例如 systemd 的 SIGTERM）。
+
+    刻意繼承 BaseException，而不是 Exception：下載器內部有多層「一般錯誤要記錄後
+    繼續／回傳 False」的廣泛 except Exception。取消必須穿過那些攔截點，讓檔案 context
+    manager 與 manifest 的 finally 先收尾，再由 CLI 以 128 + signal 回報。
+    """
+
+    def __init__(self, signum):
+        super().__init__("transfer cancelled by signal {}".format(signum))
+        self.signum = signum
+
+
 def format_size(num_bytes):
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB"):
@@ -364,13 +377,26 @@ class SFTPBase:
     def run(self):
         """統一進入點：呼叫子類別的 _run() 執行實際傳輸。
 
-        無論傳輸成功、失敗或中途中止（帳密錯誤、達重試上限、未預期例外），
-        最後都會在 upload_log 開啟時把 log 上傳回 remote，確保「最需要遠端紀錄的失敗情境」
-        也留得下 log。log 上傳本身的錯誤已在 _upload_log_file 內部吞掉，不影響回傳值。"""
+        傳輸成功或一般失敗（帳密錯誤、達重試上限、未預期例外）時，最後都會在 upload_log
+        開啟時把 log 上傳回 remote。SIGTERM 取消則只 flush 本地 log、略過遠端 upload，避免
+        收尾又進入可能無限等待的網路路徑。log 上傳本身的錯誤已在 _upload_log_file 內部吞掉，
+        不影響回傳值。"""
+        cancelled = False
         try:
             return self._run()
+        except TransferCancelled:
+            cancelled = True
+            self.logger.warning("=== 收到終止要求：已保存本地續傳進度，停止本次傳輸 ===")
+            # CSV handler 每行本來就 flush；這裡再做一次，明確保證 SIGTERM 返回前本地
+            # 記錄已落盤。遠端 log upload 需要重新連線，取消時不能再掉入無限重試。
+            for handler in self.logger.handlers:
+                try:
+                    handler.flush()
+                except Exception:
+                    pass
+            raise
         finally:
-            if self.upload_log:
+            if self.upload_log and not cancelled:
                 self._upload_log_file()
 
 
@@ -524,6 +550,7 @@ class SFTPDownloader(SFTPBase):
         # 記住上次印進度的時間與位元組數，用差值算「這段期間的即時速率」，比整體平均更能反映當下網速。
         last_log_time = start_time
         last_log_bytes = transferred
+        cancelled = False
         try:
             with self.sftp.open(remote_file, "rb") as remote_f:
                 remote_f.seek(local_size)
@@ -561,6 +588,16 @@ class SFTPDownloader(SFTPBase):
                                 }
                                 self._save_manifest(local_root)
                                 last_checkpoint_pct = pct
+        except TransferCancelled:
+            cancelled = True
+            # Python signal 可能恰好落在 local_f.write() 已完成、running_hash / transferred
+            # 尚未更新的兩個 bytecode 之間。此時只相信記憶體 counter 會少記一個 chunk。
+            # with 已先關閉並 flush 本地檔案，所以取消時從磁碟重算一次，讓 manifest 與
+            # 實際 .part 精確一致；正常傳輸沒有這筆額外成本。
+            if self.resume and part_file.exists():
+                transferred = part_file.stat().st_size
+                running_hash = self._hash_local_file(part_file)
+            raise
         finally:
             # 不論成功、失敗或中途被中斷，都存下目前實際寫到的位置與雜湊，讓下次重試時
             # 能正確判斷「這是同一版本尚未下載完的部分」，而不是每次中斷後都只能整份重來。
@@ -572,6 +609,11 @@ class SFTPDownloader(SFTPBase):
                     "local_bytes": transferred,
                 }
                 self._save_manifest(local_root)
+                if cancelled:
+                    self.logger.warning(
+                        f"取消 checkpoint: {rel_path} offset={transferred}/{remote_size}, "
+                        f"mtime={remote_mtime}, sha256={running_hash.hexdigest()}"
+                    )
 
         total_elapsed = time.time() - start_time
         downloaded_bytes = transferred - local_size  # 本次實際下載的位元組（不含斷點續傳前已存在的部分）

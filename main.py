@@ -10,14 +10,20 @@ import argparse
 import getpass
 import os
 import subprocess
+import signal
 import sys
 from pathlib import Path
 
-from downloader import SFTPDownloader, create_logger
+from downloader import SFTPDownloader, TransferCancelled, create_logger
 from settings import PlaceholderError, load_settings
 from uploader import SFTPUploader
 
 DEFAULT_LOG_DIR = Path(__file__).resolve().parent / "logs"
+
+
+def _cancel_on_signal(signum, _frame):
+    """把 SIGTERM 轉成可展開 stack 的取消，實際 I/O 由各層 finally 負責。"""
+    raise TransferCancelled(signum)
 
 
 def build_parser():
@@ -252,7 +258,14 @@ def main():
 
     parser = build_parser()
     args = parser.parse_args()
-    return run_cli(args)
+    previous_sigterm = signal.signal(signal.SIGTERM, _cancel_on_signal)
+    try:
+        return run_cli(args)
+    except TransferCancelled as exc:
+        # shell / systemd 慣例：被 signal N 終止 → 128 + N；SIGTERM 即 143。
+        return 128 + int(exc.signum)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

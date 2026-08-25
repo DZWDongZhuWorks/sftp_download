@@ -802,6 +802,119 @@ class TestDownloadOneFileCheckpointing:
         # 半截內容只存在於暫存檔；目的地在下載完成前不該出現
         assert not (tmp_path / "f.bin").exists()
 
+    def test_sigterm_cancellation_checkpoints_exact_progress_and_resumes(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """SIGTERM 必須保存精確 offset；下一輪只讀剩餘 bytes，不退回 10% checkpoint。"""
+        content = b"C" * (dl.CHUNK_SIZE * 4)
+        target = tmp_path / "f.bin"
+        target.write_bytes(b"old-complete-version")
+        d = downloader_factory()
+        first_sftp = fake_sftp_factory(files={"/remote/f.bin": content}, mtimes={"/remote/f.bin": 88})
+        original_open = first_sftp.open
+        reads = {"n": 0}
+
+        def cancelling_open(path, mode="rb"):
+            fake_file = original_open(path, mode)
+            original_read = fake_file.read
+
+            def cancelling_read(n=-1):
+                reads["n"] += 1
+                if reads["n"] == 3:
+                    raise dl.TransferCancelled(15)
+                return original_read(n)
+
+            fake_file.read = cancelling_read
+            return fake_file
+
+        first_sftp.open = cancelling_open
+        d.sftp = first_sftp
+        with pytest.raises(dl.TransferCancelled):
+            d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        part = tmp_path / ("f.bin" + dl.PART_SUFFIX)
+        manifest = d._load_manifest(tmp_path)["f.bin"]
+        assert manifest["size"] == len(content)
+        assert manifest["mtime"] == 88
+        assert manifest["local_bytes"] == dl.CHUNK_SIZE * 2
+        assert manifest["local_bytes"] == part.stat().st_size
+        assert manifest["local_sha256"] == hashlib.sha256(part.read_bytes()).hexdigest()
+        assert target.read_bytes() == b"old-complete-version"
+        assert any(
+            "取消 checkpoint: f.bin offset={}/{}".format(dl.CHUNK_SIZE * 2, len(content)) in record.message
+            for record in caplog.records
+        )
+
+        resumed = downloader_factory()
+        resumed._manifest = resumed._load_manifest(tmp_path)
+        second_sftp = fake_sftp_factory(files={"/remote/f.bin": content}, mtimes={"/remote/f.bin": 88})
+        resumed_read_sizes = []
+        second_open = second_sftp.open
+
+        def tracking_open(path, mode="rb"):
+            fake_file = second_open(path, mode)
+            original_read = fake_file.read
+
+            def tracking_read(n=-1):
+                chunk = original_read(n)
+                resumed_read_sizes.append(len(chunk))
+                return chunk
+
+            fake_file.read = tracking_read
+            return fake_file
+
+        second_sftp.open = tracking_open
+        resumed.sftp = second_sftp
+        assert resumed._download_one_file("/remote/f.bin", "f.bin", tmp_path) == "downloaded"
+        assert target.read_bytes() == content
+        assert sum(resumed_read_sizes) == len(content) - dl.CHUNK_SIZE * 2
+
+    def test_sigterm_after_local_write_rehashes_the_actual_part(
+        self, downloader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        """signal 落在 write 與 running counter 之間，manifest 仍須以磁碟實況為準。"""
+        content = b"W" * (dl.CHUNK_SIZE * 3)
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/race.bin": content}, mtimes={"/remote/race.bin": 99})
+        part = tmp_path / ("race.bin" + dl.PART_SUFFIX)
+        real_open = open
+        writes = {"n": 0}
+
+        class CancellingLocalFile:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return self.wrapped.__exit__(exc_type, exc, tb)
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+            def write(self, chunk):
+                result = self.wrapped.write(chunk)
+                writes["n"] += 1
+                if writes["n"] == 2:
+                    raise dl.TransferCancelled(15)
+                return result
+
+        def race_open(path, mode="r", *args, **kwargs):
+            wrapped = real_open(path, mode, *args, **kwargs)
+            if Path(path) == part and mode in ("wb", "ab"):
+                return CancellingLocalFile(wrapped)
+            return wrapped
+
+        monkeypatch.setattr("builtins.open", race_open)
+        with pytest.raises(dl.TransferCancelled):
+            d._download_one_file("/remote/race.bin", "race.bin", tmp_path)
+
+        manifest = d._load_manifest(tmp_path)["race.bin"]
+        assert part.stat().st_size == dl.CHUNK_SIZE * 2
+        assert manifest["local_bytes"] == part.stat().st_size
+        assert manifest["local_sha256"] == hashlib.sha256(part.read_bytes()).hexdigest()
+
     def test_progress_logged_and_increases_monotonically(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
         content = b"Z" * (dl.CHUNK_SIZE * 5)
         d = downloader_factory()
@@ -1298,6 +1411,38 @@ class TestRun:
         result = d.run()
         assert result is False
         d._upload_log_file.assert_called_once()
+
+    def test_cancel_flushes_local_log_and_skips_remote_log_upload(self, downloader_factory):
+        d = downloader_factory(upload_log=True, remote_log_dir="/logs")
+        d._run = MagicMock(side_effect=dl.TransferCancelled(15))
+        d._upload_log_file = MagicMock()
+        handlers = [MagicMock(level=0), MagicMock(level=0)]
+        d.logger.handlers = handlers
+
+        with pytest.raises(dl.TransferCancelled):
+            d.run()
+
+        d._upload_log_file.assert_not_called()
+        for handler in handlers:
+            handler.flush.assert_called_once()
+
+    def test_cancel_unwinds_run_and_closes_sftp_connection(self, downloader_factory, fake_sftp_factory):
+        d = self._prepare(
+            downloader_factory,
+            fake_sftp_factory,
+            files={"/remote/a.txt": b"A"},
+            mtimes={"/remote/a.txt": 1},
+            upload_log=True,
+            remote_log_dir="/logs",
+        )
+        d._download_one_file = MagicMock(side_effect=dl.TransferCancelled(15))
+        d._upload_log_file = MagicMock()
+
+        with pytest.raises(dl.TransferCancelled):
+            d.run()
+
+        d._close.assert_called_once()
+        d._upload_log_file.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
