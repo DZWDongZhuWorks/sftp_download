@@ -376,7 +376,7 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 - 下載 log 依 `log_remote_dir` 自動上傳到岸端 `sftp_logs/download/{vsl_name}/{ipc}/radar`，用 `monitor/tui.py` 開該筆 log 即可看到版本 —— 這是岸端逐船確認 OTA 版本最快的路。
 - 「下載後」的版本由 scheduler 的 `reboot_script/start_radar.sh` 在 update 相位前後各印一行到 launcher.log（開機與每日 `nssms-warm-env` 都走這條）；兩行相同就代表這次沒有換版。
 
-> **GUI 例外**：GUI 不走 `run_cli()`（它自己呼叫 `create_logger` / `SFTPUploader`），用 GUI 上傳 radar 前請先手動執行一次 `radar/tools/stamp_version.py`。
+> **GUI 例外**：GUI 不走 `run_cli()`（它自己呼叫 `create_logger` / `SFTPUploader`），所以 GUI 上傳不會產生版本標記。radar 不以 GUI 發布；真要用的話請先手動執行一次 `radar/tools/stamp_version.py`，否則船上會顯示 `files:UNSTAMPED`。
 >
 > 設定檔裡的 `version_info` 欄位對 radar 留空即可 —— `config/` 是 gitignored 且會被岸端 STANDARD 覆寫，填死在那裡的字串無法隨程式版本一起變。
 

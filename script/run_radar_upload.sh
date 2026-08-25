@@ -7,7 +7,7 @@
 # 因此不論走這支、run_all_uploads.py、run_selected_transfers.py 還是手動
 # `main.py --cli --mode upload --config config/radar_upload_settings.json`，
 # 都會帶上版本標記；這支只是慣例上的具名入口（比照 run_share_upload.sh）。
-# 例外：GUI 不走 run_cli，用 GUI 上傳 radar 前請自行執行一次 radar/tools/stamp_version.py。
+# 例外：GUI 不走 run_cli，不會產生版本標記 —— radar 不以 GUI 發布，用了船上會顯示 files:UNSTAMPED。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
