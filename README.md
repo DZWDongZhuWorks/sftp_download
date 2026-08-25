@@ -357,11 +357,21 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
 
 `radar` 這個專案的 `version_info` 不填在設定檔裡，而是由 run script 在執行時從 radar 自己的版本標記檔取出、以 `--version-info` 傳入：
 
-- 版本標記 `radar/VERSION.json` 由發布端的 `radar/tools/stamp_version.py` 產生（語意版號 + git commit/branch/dirty + 每個檔的 sha256），隨整目錄鏡像上船；船上沒有 `.git`，所以只能在開發機產生。
-- `script/run_radar_download.sh` 會把「下載前」的本機版本寫進 log CSV 的 `version_info` 欄。那份 log 依 `log_remote_dir` 自動上傳到岸端 `sftp_logs/download/{vsl_name}/{ipc}/radar`，用 `monitor/tui.py` 開該筆 log 即可看到版本 —— 這是岸端逐船確認 OTA 版本最快的路。
-- 「下載後」的版本由 scheduler 的 `reboot_script/start_radar.sh` 記進 launcher.log；與下載前相同就代表這次 OTA 沒有換版。
-- 發布 radar 請用 `script/run_radar_upload.sh`（先 stamp 再上傳）。`run_all_uploads.py` 會繞過 stamp，上傳的是舊的 `VERSION.json`。
+`main.py` 的 `run_cli()` 會檢查待傳輸目錄（`local_path`）底下有沒有 `tools/stamp_version.py`：
 
+- **有**（目前只有 radar）：上傳前先執行它產生 `radar/VERSION.json`（語意版號 + git commit/branch/dirty + 每個檔的 sha256）；接著以 `--print` 取得版本字串，在呼叫端沒有明確指定 `--version-info` 時填進 log 的 `version_info` 欄。下載時只讀不寫，取到的是「下載前」的版本。
+- **沒有**：完全照舊，其他專案不受影響。
+
+這是一個約定，任何專案只要放一支支援「無參數 = 產生標記、`--print` = 印單行版本」的 `tools/stamp_version.py` 就能沿用。
+
+放在 `run_cli()` 而不是某支 `run_*.sh` 的理由：發布與更新有很多條路（`run_all_uploads.py`、`run_selected_transfers.py`、`run_radar_*.sh`、手動 `main.py --cli`），`run_cli()` 是它們共同的收口；只在單一腳本裡處理的話，換一條路走就靜默失去版本資訊。
+
+- 船上沒有 `.git`，所以版本標記只能在發布端產生 —— 這也是「上傳前」而非上傳後的原因。
+- 下載 log 依 `log_remote_dir` 自動上傳到岸端 `sftp_logs/download/{vsl_name}/{ipc}/radar`，用 `monitor/tui.py` 開該筆 log 即可看到版本 —— 這是岸端逐船確認 OTA 版本最快的路。
+- 「下載後」的版本由 scheduler 的 `reboot_script/start_radar.sh` 在 update 相位前後各印一行到 launcher.log（開機與每日 `nssms-warm-env` 都走這條）；兩行相同就代表這次沒有換版。
+
+> **GUI 例外**：GUI 不走 `run_cli()`（它自己呼叫 `create_logger` / `SFTPUploader`），用 GUI 上傳 radar 前請先手動執行一次 `radar/tools/stamp_version.py`。
+>
 > 設定檔裡的 `version_info` 欄位對 radar 留空即可 —— `config/` 是 gitignored 且會被岸端 STANDARD 覆寫，填死在那裡的字串無法隨程式版本一起變。
 
 ---

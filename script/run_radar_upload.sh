@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# 發布 radar（開發端 → STANDARD/radar）。這是 radar 的唯一正式發布路徑。
+# 發布 radar（開發端 → STANDARD/radar）。
 #
-# 為什麼要有這支專屬腳本：radar 的版本標記 VERSION.json 必須「上傳前」在這台開發機
-# 產生（船上沒有 .git，算不出自己是哪個 commit），所以發布動作 = stamp + upload 兩步。
-# run_all_uploads.py 會 glob 所有 *_upload_settings.json、繞過 stamp，那條路徑上傳的
-# 就是舊的（或不存在的）VERSION.json —— 船上開機時的 sha256 驗證會把它顯示成
-# files:MISMATCH / files:UNSTAMPED，不會靜默混過去，但要正確發布請用這支。
-#
-# 未提交的修改（dirty）只警告不中止，dirty: true 會寫進 VERSION.json。
+# 版本標記：main.py 會在上傳前自動執行 radar/tools/stamp_version.py 產生 VERSION.json
+# （船上沒有 .git，算不出自己是哪個 commit，所以只能在發布端產生），並把版本字串填進
+# log CSV 的 version_info 欄 —— 見 main.py 的 _apply_version_stamp。
+# 因此不論走這支、run_all_uploads.py、run_selected_transfers.py 還是手動
+# `main.py --cli --mode upload --config config/radar_upload_settings.json`，
+# 都會帶上版本標記；這支只是慣例上的具名入口（比照 run_share_upload.sh）。
+# 例外：GUI 不走 run_cli，用 GUI 上傳 radar 前請自行執行一次 radar/tools/stamp_version.py。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,23 +35,4 @@ if [[ ! -x "$VENV_PY" ]]; then
     exit 1
 fi
 
-RADAR_DIR="$BASE_DIR/../../radar"
-STAMP="$RADAR_DIR/tools/stamp_version.py"
-radar_version="unknown"
-
-if command -v python3 >/dev/null 2>&1 && [[ -f "$STAMP" ]]; then
-    echo "=== 產生 radar 版本標記 (VERSION.json) ==="
-    # stamp 失敗（不是 git repo、解析不到 __version__）只警告：版本標記是觀測用的，
-    # 不該讓發布本身停擺；但船上會看到 files:UNSTAMPED，所以這裡一定要吵。
-    if ! python3 "$STAMP"; then
-        echo "*** 警告: 產生 VERSION.json 失敗，這次發布的內容將是「未標記版本」 ***" >&2
-    fi
-    radar_version="$(python3 "$STAMP" --print 2>/dev/null || true)"
-    [[ -z "$radar_version" ]] && radar_version="unknown"
-else
-    echo "*** 警告: 找不到 python3 或 $STAMP，略過版本標記 ***" >&2
-fi
-
-echo "=== 上傳 radar（版本: $radar_version）==="
-"$VENV_PY" "$BASE_DIR/main.py" --cli --mode upload --config "$config" \
-    --version-info "$radar_version"
+"$VENV_PY" "$BASE_DIR/main.py" --cli --mode upload --config "$config"

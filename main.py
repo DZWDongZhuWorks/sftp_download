@@ -9,6 +9,7 @@
 import argparse
 import getpass
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -89,6 +90,67 @@ def build_parser():
     return parser
 
 
+# 待傳輸專案若自帶版本標記腳本，就放在這個相對路徑（目前只有 radar 有）。
+VERSION_STAMP_REL = Path("tools") / "stamp_version.py"
+
+
+def _version_stamp_script(local_path):
+    """回傳 local_path 底下的版本標記腳本，沒有就回 None。
+
+    這是一個**約定**而非某個專案的特例：任何專案只要在自己根目錄放一支
+    `tools/stamp_version.py`（無參數 = 產生版本標記、`--print` = 印出單行版本字串），
+    就自動獲得下面 _apply_version_stamp() 的行為，不必再改這裡。
+    """
+    if not local_path:
+        return None
+    try:
+        script = (Path(local_path) / VERSION_STAMP_REL).resolve()
+    except OSError:
+        return None
+    return script if script.is_file() else None
+
+
+def _apply_version_stamp(mode, local_path, version_info):
+    """上傳前產生版本標記；並在未指定 version_info 時以該版本填入 log 的 version_info 欄。
+
+    為什麼放在這裡而不是某支 run_*.sh：發布/更新有很多條路（run_all_uploads.py、
+    run_selected_transfers.py、run_radar_*.sh、手動 main.py --cli），run_cli 是它們**共同**
+    的收口。放在單一腳本裡的話，換一條路走就靜默失去版本資訊。
+    （GUI 不走 run_cli，另有自己的流程，不受這裡影響。）
+
+    上傳 = 發布端動作，必須「上傳前」產生標記：船上沒有 .git，算不出自己是哪個 commit。
+    下載時只讀不寫，取到的是「下載前」的版本 —— 那正是要記進 log 的（下載後的版本由
+    scheduler 的 start_radar.sh 記進 launcher.log）。
+    任何失敗都只警告：版本資訊是觀測用的，不該讓傳輸本身停擺。標記缺漏不會被吃掉 ——
+    船上開機時的 sha256 驗證會顯示成 files:UNSTAMPED / files:MISMATCH。
+    """
+    script = _version_stamp_script(local_path)
+    if script is None:
+        return version_info
+    if mode == "upload":
+        print(f"=== 產生版本標記: {script} ===")
+        try:
+            if subprocess.call([sys.executable, str(script)], timeout=600) != 0:
+                print("警告：產生版本標記失敗，這次上傳的內容將是「未標記版本」", file=sys.stderr)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"警告：無法執行版本標記腳本（{e}）", file=sys.stderr)
+    if version_info:
+        return version_info      # 呼叫端明確指定過，不覆蓋
+    try:
+        # capture_output= / text= 是 3.7+，Bionic 船端只有 3.6（見 tests 的
+        # ShipInterpreterCompatTests）。
+        proc = subprocess.run([sys.executable, str(script), "--print"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, timeout=600)
+        stamped = (proc.stdout or "").strip().splitlines()
+        if stamped and stamped[0]:
+            print(f"版本: {stamped[0]}")
+            return stamped[0]
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"警告：無法取得版本字串（{e}）", file=sys.stderr)
+    return "unknown"
+
+
 def _resolve(cli_value, settings, key, fallback=None):
     if cli_value is not None:
         return cli_value
@@ -148,6 +210,10 @@ def run_cli(args):
     password = args.password or os.environ.get("SFTP_PASSWORD") or settings.get("password")
     if not key_file and not password:
         password = getpass.getpass(f"請輸入 {username}@{host} 的密碼: ")
+
+    # 待傳輸的專案自帶 tools/stamp_version.py 時：上傳前先產生版本標記，並把版本填進
+    # log 的 version_info 欄（見 _apply_version_stamp）。其他專案不受影響。
+    version_info = _apply_version_stamp(mode, local_path, version_info)
 
     logger, log_file = create_logger(log_dir, device_name, version_info, mode=mode)
     transfer_cls = SFTPUploader if mode == "upload" else SFTPDownloader
