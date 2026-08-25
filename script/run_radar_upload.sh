@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 發布 radar（開發端 → STANDARD/radar）。
 #
-# 版本標記：main.py 會在上傳前自動執行 radar/tools/stamp_version.py 產生 VERSION.json
+# 版本標記：main.py 會在上傳前自動執行 radar/tools/stamp_version.py 產生 VERSION.stamp.json
 # （船上沒有 .git，算不出自己是哪個 commit，所以只能在發布端產生），並把版本字串填進
 # log CSV 的 version_info 欄 —— 見 main.py 的 _apply_version_stamp。
 # 因此不論走這支、run_all_uploads.py、run_selected_transfers.py 還是手動

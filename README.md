@@ -359,7 +359,7 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
 
 `main.py` 的 `run_cli()` 會檢查待傳輸目錄（`local_path`）底下有沒有 `tools/stamp_version.py`：
 
-- **有**（目前只有 radar）：上傳前先執行它產生 `radar/VERSION.json`（語意版號 + git commit/branch/dirty + 每個檔的 sha256）；接著以 `--print` 取得版本字串，在呼叫端沒有明確指定 `--version-info` 時填進 log 的 `version_info` 欄。下載時只讀不寫，取到的是「下載前」的版本。
+- **有**（目前只有 radar）：上傳前先執行它產生 `radar/VERSION.stamp.json`（人工宣告於 `radar/VERSION.json` 的版號 + git commit/branch/dirty + 每個檔的 sha256）；接著以 `--print` 取得版本字串，在呼叫端沒有明確指定 `--version-info` 時填進 log 的 `version_info` 欄。下載時只讀不寫，取到的是「下載前」的版本。
 - **沒有**：完全照舊，其他專案不受影響。
 
 這是一個約定，任何專案只要放一支支援「無參數 = 產生標記、`--print` = 印單行版本」的 `tools/stamp_version.py` 就能沿用。
