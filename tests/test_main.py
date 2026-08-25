@@ -1,6 +1,7 @@
 """main.py 單元測試：CLI 參數解析與 settings.json 合併邏輯。"""
 
 import json
+import signal
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import main as main_module
+from downloader import TransferCancelled
 
 
 def make_args(**overrides):
@@ -41,6 +43,18 @@ class TestResolve:
 
     def test_cli_value_of_false_is_respected(self):
         assert main_module._resolve(False, {"key": True}, "key") is False
+
+
+def test_sigterm_handler_raises_cancellable_exception():
+    with pytest.raises(TransferCancelled) as exc_info:
+        main_module._cancel_on_signal(signal.SIGTERM, None)
+    assert exc_info.value.signum == signal.SIGTERM
+
+
+def test_main_returns_143_for_sigterm_cancellation(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--cli"])
+    monkeypatch.setattr(main_module, "run_cli", MagicMock(side_effect=TransferCancelled(signal.SIGTERM)))
+    assert main_module.main() == 143
 
 
 class TestRunCliSettingsOnly:
