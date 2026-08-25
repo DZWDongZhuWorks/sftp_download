@@ -353,6 +353,17 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
 
 畫面／終端機顯示的仍是易讀文字，但本地儲存的 log 檔（`logs/` 資料夾內、副檔名 `.csv`）是 **CSV 格式**，欄位為 `timestamp, device_name, version_info, level, message`（`version_info` 為選填欄位，未填則該欄位為空），可直接用 Excel 開啟；若把上百台裝置的 log 檔集中到同一資料夾，可直接合併成一份總表，用「裝置名稱」或「版號」欄位篩選、用「時間」排序即可彙整查看所有裝置的下載狀況。
 
+### radar 的 version_info（程式碼版本）
+
+`radar` 這個專案的 `version_info` 不填在設定檔裡，而是由 run script 在執行時從 radar 自己的版本標記檔取出、以 `--version-info` 傳入：
+
+- 版本標記 `radar/VERSION.json` 由發布端的 `radar/tools/stamp_version.py` 產生（語意版號 + git commit/branch/dirty + 每個檔的 sha256），隨整目錄鏡像上船；船上沒有 `.git`，所以只能在開發機產生。
+- `script/run_radar_download.sh` 會把「下載前」的本機版本寫進 log CSV 的 `version_info` 欄。那份 log 依 `log_remote_dir` 自動上傳到岸端 `sftp_logs/download/{vsl_name}/{ipc}/radar`，用 `monitor/tui.py` 開該筆 log 即可看到版本 —— 這是岸端逐船確認 OTA 版本最快的路。
+- 「下載後」的版本由 scheduler 的 `reboot_script/start_radar.sh` 記進 launcher.log；與下載前相同就代表這次 OTA 沒有換版。
+- 發布 radar 請用 `script/run_radar_upload.sh`（先 stamp 再上傳）。`run_all_uploads.py` 會繞過 stamp，上傳的是舊的 `VERSION.json`。
+
+> 設定檔裡的 `version_info` 欄位對 radar 留空即可 —— `config/` 是 gitignored 且會被岸端 STANDARD 覆寫，填死在那裡的字串無法隨程式版本一起變。
+
 ---
 
 ## 【常見錯誤排除】

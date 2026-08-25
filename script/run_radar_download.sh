@@ -30,4 +30,19 @@ if [[ ! -x "$VENV_PY" ]]; then
     exit 1
 fi
 
-"$VENV_PY" "$BASE_DIR/main.py" --cli --config "$config"
+# 記下「下載前」的本機 radar 版本。main.py 會把它寫進 log CSV 的 version_info 欄，
+# 而那份 log 依 radar_download_settings.json 的 log_remote_dir 自動上傳到岸端
+# sftp_logs/download/{vsl_name}/{ipc}/radar，岸端用 monitor/tui.py 即可逐船看版本。
+# 「下載後」的版本由 scheduler 的 reboot_script/start_radar.sh 記進 launcher.log：
+# 兩者相同就表示這次 OTA 沒有換版。
+# 版本取自 radar 的 VERSION.json（發布端 tools/stamp_version.py 產生，隨鏡像上船）；
+# 取不到（還沒 stamp、OTA 不完整、沒有 python3）一律以 unknown 帶過，絕不擋下下載。
+RADAR_DIR="$BASE_DIR/../../radar"
+radar_version="unknown"
+if command -v python3 >/dev/null 2>&1 && [[ -f "$RADAR_DIR/tools/stamp_version.py" ]]; then
+    radar_version="$(python3 "$RADAR_DIR/tools/stamp_version.py" --print 2>/dev/null || true)"
+    [[ -z "$radar_version" ]] && radar_version="unknown"
+fi
+echo "radar 版本（下載前）: $radar_version"
+
+"$VENV_PY" "$BASE_DIR/main.py" --cli --config "$config" --version-info "$radar_version"
