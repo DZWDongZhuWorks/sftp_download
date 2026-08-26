@@ -70,6 +70,10 @@ class RunRecord:
     path: Path
     device_name: str
     mode: str  # 'download' | 'upload'
+    # 該次傳輸的程式碼版本（CSV 第三欄）。舊 log 與尚未宣告 VERSION.json 的專案是空字串 ——
+    # 版本標記是後來才加的，船隊裡新舊 log 會並存很久，所以呈現端一律要能吃空值。
+    # 給預設值也是為了向上相容：既有的 RunRecord(...) 呼叫端不必跟著改。
+    version_info: str = ""
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     file_count: Optional[int] = None
@@ -135,6 +139,7 @@ def parse_log_file(path) -> Optional[RunRecord]:
     """解析單一 CSV log 檔為 RunRecord；檔案損壞/非本工具格式回傳 None。"""
     path = Path(path)
     device_name = ""
+    version_info = ""
     started_at = None
     ended_at = None
     file_count = None
@@ -156,10 +161,13 @@ def parse_log_file(path) -> Optional[RunRecord]:
             for row in reader:
                 if len(row) < 5:
                     continue
-                ts_raw, dev, _version, level, message = row[0], row[1], row[2], row[3], row[4]
+                ts_raw, dev, version, level, message = row[0], row[1], row[2], row[3], row[4]
                 saw_rows = True
                 if dev and not device_name:
                     device_name = dev
+                # 同一份 log 的每列都是同一個值（_CSVFileHandler 的實例屬性），取第一個非空的即可
+                if version and not version_info:
+                    version_info = version
                 ts = _parse_ts(ts_raw)
                 if ts is not None:
                     if started_at is None:
@@ -208,6 +216,7 @@ def parse_log_file(path) -> Optional[RunRecord]:
     return RunRecord(
         path=path,
         device_name=device_name,
+        version_info=version_info,
         mode=_detect_mode(path.name, direction),
         started_at=started_at,
         ended_at=ended_at,
@@ -941,7 +950,7 @@ def _leaf_row(d: DeviceStatus, generated_at: datetime) -> str:
         "<tr class='lf' data-mode='{mode}' data-vessel='{v}' data-ipc='{i}' "
         "data-component='{c}' data-status='{st}'>"
         "<td><span class='chip s-{st}'>{label}</span></td>"
-        "<td>{comp}</td><td>{last}</td><td>{files}</td><td>{counts}</td>"
+        "<td>{comp}</td><td>{version}</td><td>{last}</td><td>{files}</td><td>{counts}</td>"
         "<td>{age}</td><td>{detail}</td></tr>"
     ).format(
         mode=_esc(rec.mode),
@@ -951,13 +960,14 @@ def _leaf_row(d: DeviceStatus, generated_at: datetime) -> str:
         st=st,
         label=_STATUS_LABEL.get(st, st),
         comp=_esc(d.component),
+        version=_esc(rec.version_info or "—"),   # 沒宣告版號的專案是空字串 → 顯示破折號
         last=_esc(rec.started_at.strftime(TS_FMT) if rec.started_at else "—"),
         files=("—" if rec.file_count is None else rec.file_count),
         counts=_esc(_counts_str(rec)),
         age=_esc(_humanize_age(d.last_seen, generated_at)),
         detail=_esc(_detail_str(d)),
     )
-    return row + f"<tr class='detail'><td colspan='7'>{_detail_html(d)}</td></tr>"
+    return row + f"<tr class='detail'><td colspan='8'>{_detail_html(d)}</td></tr>"
 
 
 def render_html(
@@ -1005,7 +1015,7 @@ def render_html(
                     f'<span class="dot s-{ip.summary.worst}"></span>{_esc(ip.name)}'
                     f'{_html_badges(ip.summary)}<span class="match"></span></summary>'
                     "<table><thead><tr>"
-                    "<th>狀態</th><th>元件</th><th>最後執行</th><th>檔案</th>"
+                    "<th>狀態</th><th>元件</th><th>版本</th><th>最後執行</th><th>檔案</th>"
                     "<th>成功/略/失</th><th>距今</th><th>摘要</th></tr></thead><tbody>"
                 )
                 for d in ip.devices:
