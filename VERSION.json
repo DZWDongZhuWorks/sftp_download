@@ -1,7 +1,7 @@
 {
-  "version": "0.7.0",
+  "version": "0.7.1",
   "date": "2026-08-26",
-  "notes": "版本標記機制：專案根目錄放一個 VERSION.json 就自動 stamp（對應 tag v0.7.0）",
+  "notes": "本專案自己的版號宣告上線：自我更新的傳輸 log 也帶得上版本",
   "stamp_exclude": [
     "*.whl"
   ]
