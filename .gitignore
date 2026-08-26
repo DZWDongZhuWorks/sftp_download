@@ -28,3 +28,7 @@ config
 .sftp_upload_manifest.json
 .sftp_download_manifest.json
 fleet_logs/
+
+# 版本標記:上傳前由 version_stamp.py 產生的「產物」,不進 git(對外版號的宣告是
+# VERSION.json,那個要人工編輯、要進 git)。它會隨鏡像上船,這正是預期行為。
+/VERSION.stamp.json
