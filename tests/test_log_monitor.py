@@ -4,6 +4,7 @@
 不需網路：於 tmp_path 寫入含 BOM 的合成 CSV log，直接驗證解析、彙整與呈現。
 """
 import csv
+from pathlib import Path
 import subprocess
 from datetime import datetime
 from unittest import mock
@@ -11,6 +12,7 @@ from unittest import mock
 import pytest
 
 from monitor.log_monitor import (
+    RunRecord,
     aggregate_by_device,
     build_parser,
     build_tree,
@@ -27,13 +29,17 @@ from monitor.log_monitor import (
 )
 
 
-def write_log(path, device_name, rows):
-    """rows: list of (timestamp, level, message)。以本體相同格式（utf-8-sig CSV）寫出。"""
+def write_log(path, device_name, rows, version_info=""):
+    """rows: list of (timestamp, level, message)。以本體相同格式（utf-8-sig CSV）寫出。
+
+    version_info 預設空字串 —— 那是舊 log 與「還沒宣告 VERSION.json 的專案」的實際樣子，
+    也是絕大多數既有測試要的情境。
+    """
     with open(path, "w", encoding="utf-8-sig", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["timestamp", "device_name", "version_info", "level", "message"])
         for ts, level, msg in rows:
-            w.writerow([ts, device_name, "", level, msg])
+            w.writerow([ts, device_name, version_info, level, msg])
     return path
 
 
@@ -588,3 +594,38 @@ def test_read_log_rows_rejects_foreign_and_missing(tmp_path):
     assert read_log_rows(empty) == ([], False)
     # 缺檔（--watch 重新下載期間檔案可能被換掉）→ 不拋錯
     assert read_log_rows(tmp_path / "nope.csv") == ([], False)
+
+
+# --- version_info：向上相容（有些專案沒有版號）-----------------------------
+def test_parse_keeps_version_info(tmp_path):
+    """CSV 第三欄的版本要留在 RunRecord 上 —— 岸端主清單靠它回答「哪艘船跑哪一版」。"""
+    log = write_log(tmp_path / "D_WH289_IPC-1_RADAR_20260826_010000.csv",
+                    "WH289_IPC-1_RADAR", _download_rows(), version_info="0.4.1+20b8056")
+    rec = parse_log_file(log)
+    assert rec.version_info == "0.4.1+20b8056"
+
+
+def test_parse_without_version_info_is_empty(tmp_path):
+    """沒有版本是正常狀態,不是錯誤:舊 log 與尚未宣告 VERSION.json 的專案都會是空的。"""
+    log = write_log(tmp_path / "D_WH289_IPC-1_ecdis_20260826_010000.csv",
+                    "WH289_IPC-1_ecdis", _download_rows())
+    rec = parse_log_file(log)
+    assert rec.version_info == ""
+
+
+def test_parse_version_info_takes_first_non_empty(tmp_path):
+    """同一份 log 每列都是同一個值;真有前幾列空白（舊版 handler）也要取得到。"""
+    path = tmp_path / "D_WH289_IPC-1_RADAR_20260826_020000.csv"
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["timestamp", "device_name", "version_info", "level", "message"])
+        w.writerow(["2026-08-26 01:00:00", "WH289_IPC-1_RADAR", "", "INFO", "=== SFTP 下載任務開始 ==="])
+        w.writerow(["2026-08-26 01:00:01", "WH289_IPC-1_RADAR", "0.4.1+20b8056", "INFO", "共 1 個來源路徑，合併後發現 3 個檔案"])
+    assert parse_log_file(path).version_info == "0.4.1+20b8056"
+
+
+def test_run_record_version_info_defaults_to_empty():
+    """RunRecord 給了預設值 —— 既有的建構呼叫端不必跟著改（向上相容）。"""
+    rec = RunRecord(path=Path("x.csv"), device_name="d", mode="download")
+    assert rec.version_info == ""
+

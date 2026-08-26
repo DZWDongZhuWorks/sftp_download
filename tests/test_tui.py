@@ -28,7 +28,7 @@ RECENT = "2026-07-27 11:00:00"  # 1 小時前（未過期）
 OLD = "2026-07-20 11:00:00"     # 7 天前（過期）
 
 
-def _write(path, device_name, direction, when, success, skipped, failed):
+def _write(path, device_name, direction, when, success, skipped, failed, version=""):
     verb = "下載" if direction == "download" else "上傳"
     rows = [
         (when, "INFO", f"=== SFTP {verb}任務開始 ==="),
@@ -38,13 +38,16 @@ def _write(path, device_name, direction, when, success, skipped, failed):
         w = csv.writer(fh)
         w.writerow(["timestamp", "device_name", "version_info", "level", "message"])
         for ts, level, msg in rows:
-            w.writerow([ts, device_name, "", level, msg])
+            w.writerow([ts, device_name, version, level, msg])
 
 
 def _tree(tmp_path, specs, stale_hours=24):
-    for i, (dev, direction, when, s, k, f) in enumerate(specs):
+    """specs 每筆 6 欄（無版本，等同舊 log）或 7 欄（第 7 欄為版本字串）。"""
+    for i, spec in enumerate(specs):
+        dev, direction, when, s, k, f = spec[:6]
+        version = spec[6] if len(spec) > 6 else ""
         prefix = "D_" if direction == "download" else "U_"
-        _write(tmp_path / f"{prefix}{dev}_{i}.csv", dev, direction, when, s, k, f)
+        _write(tmp_path / f"{prefix}{dev}_{i}.csv", dev, direction, when, s, k, f, version)
     devices = aggregate_by_device(collect_logs(tmp_path), now=NOW, stale_hours=stale_hours)
     return build_tree(devices)
 
@@ -941,11 +944,12 @@ def test_collapse_or_parent_does_not_jump_in_flat(tmp_path):
 def test_sort_reducers_and_defaults():
     st = tui.TuiState()
     assert (st.flat, st.sort_key, st.sort_desc) == (False, "船隻名稱", False)
-    assert tui._SORT_CYCLE == ["船隻名稱", "更新時間", "嚴重度", "裝置名稱"]
+    assert tui._SORT_CYCLE == ["船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本"]
 
     tui.cycle_sort(st); assert st.sort_key == "更新時間"
     tui.cycle_sort(st); assert st.sort_key == "嚴重度"
     tui.cycle_sort(st); assert st.sort_key == "裝置名稱"
+    tui.cycle_sort(st); assert st.sort_key == "版本"
     tui.cycle_sort(st); assert st.sort_key == "船隻名稱"    # 繞回
     st.sort_key = "亂填"
     tui.cycle_sort(st); assert st.sort_key == "更新時間"     # 不在循環內也不炸
@@ -1095,3 +1099,87 @@ def test_key_press_reorders_flat_list(tmp_path):
     tui.expand_all(st, tree)
     names = [r.ref.device_name for r in tui.visible_rows(tree, st, NOW) if r.kind == "device"]
     assert names == sorted(names, key=str.casefold)
+
+
+# --- 版本欄：向上相容（有些專案沒有版號）-----------------------------------
+def _dev_with_version(version):
+    return SimpleNamespace(latest=SimpleNamespace(version_info=version))
+
+
+def _col_start(line, needle):
+    """needle 在該列的**顯示**起點（CJK 全形算 2 欄，不能用字元索引比）。"""
+    return tui.disp_width(line[:line.index(needle)])
+
+
+def test_version_str_handles_missing_version():
+    """沒有版本是正常狀態（舊 log / 尚未宣告 VERSION.json 的專案），要顯示破折號而非爆掉。"""
+    assert tui._version_str(SimpleNamespace(version_info="0.4.1+20b8056")) == "0.4.1+20b8056"
+    assert tui._version_str(SimpleNamespace(version_info="")) == "—"
+    assert tui._version_str(SimpleNamespace(version_info="   ")) == "—"
+    assert tui._version_str(SimpleNamespace(version_info=None)) == "—"
+    assert tui._version_str(SimpleNamespace()) == "—"          # 連欄位都沒有的舊物件
+
+
+def test_device_line_shows_version_without_growing_the_row(tmp_path):
+    """版本欄的寬度是跟摘要借的：分群模式的列已有 3 層縮排，整列再長 17 欄會把摘要推出畫面。
+
+    摘要短的時候整列本來就不會補滿，所以這裡把摘要灌長來逼出上限，比的是「最寬會多寬」。
+    """
+    tree = _tree(tmp_path, [("WH289_IPC-1_RADAR", "download", RECENT, 5, 1, 0, "0.4.1+20b8056")])
+    dev = tree[0].vessels[0].ipcs[0].devices[0]
+    with mock.patch.object(tui, "_detail_str", return_value="x" * 200):
+        with_v = tui._device_line(dev, NOW, True)
+        without_v = tui._device_line(dev, NOW, False)
+    assert "0.4.1+20b8056" in with_v
+    assert "0.4.1+20b8056" not in without_v
+    assert tui.disp_width(with_v) == tui.disp_width(without_v)
+
+
+def test_device_line_without_version_shows_dash(tmp_path):
+    tree = _tree(tmp_path, [("WH289_IPC-1_ecdis", "download", RECENT, 5, 1, 0)])
+    dev = tree[0].vessels[0].ipcs[0].devices[0]
+    assert "—" in tui._device_line(dev, NOW, True)
+
+
+def test_flat_layout_inserts_version_after_component():
+    """版本插在「方向 船 IPC 元件」之後：身分後面接版本才好讀。"""
+    cols_off, aligns_off = tui._flat_layout(False)
+    cols_on, aligns_on = tui._flat_layout(True)
+    assert cols_off == tui._FLAT_COLS
+    assert len(cols_on) == len(cols_off) + 1
+    assert cols_on[4] == tui._VERSION_W and aligns_on[4] == "left"
+    assert cols_on[:4] == cols_off[:4] and cols_on[5:] == cols_off[4:]
+
+
+def test_flat_header_and_row_agree_on_columns(tmp_path):
+    """表頭與內文共用同一份版面 —— 兩邊各算一次遲早會錯開。"""
+    tree = _tree(tmp_path, [("WH289_IPC-1_RADAR", "download", RECENT, 5, 1, 0, "0.10.0+811a5c3")])
+    item = tui.tree_devices(tree)[0]
+    for show in (True, False):
+        header = tui.flat_header_line(show)
+        row = tui._FLAT_GUTTER + tui._device_line_flat(item, NOW, show)
+        assert ("版本" in header) is show
+        assert ("0.10.0+811a5c3" in row) is show
+        # 「最後執行」這一欄在表頭與內文的顯示起點必須一致（欄位起點只有一個來源）
+        assert _col_start(header, "最後執行") == _col_start(row, "07-27 11:00")
+
+
+def test_sort_by_version_groups_same_version_and_pushes_missing_last():
+    """版本排序是把同版本的船聚在一起；沒有版本的排最後（一整排破折號排前面只會擋路）。"""
+    assert tui.sort_value(_dev_with_version("0.4.1+aaa"), "版本") == "0.4.1+aaa"
+    assert tui.sort_value(_dev_with_version(""), "版本") == "~"
+    devs = [_dev_with_version(""), _dev_with_version("0.4.1+aaa"), _dev_with_version("0.4.1+aaa")]
+    ordered = sorted(devs, key=lambda d: tui.sort_value(d, "版本"))
+    assert [tui.sort_value(d, "版本") for d in ordered] == ["0.4.1+aaa", "0.4.1+aaa", "~"]
+
+
+def test_toggle_version_flag():
+    st = tui.TuiState()
+    assert st.show_version is True                 # 預設顯示：這是最常要的答案
+    tui.toggle_version(st); assert st.show_version is False
+    tui.toggle_version(st); assert st.show_version is True
+
+
+def test_key_v_maps_to_toggle_version():
+    assert tui.key_action(ord("v")) == "toggle_version"
+

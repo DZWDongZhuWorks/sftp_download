@@ -44,9 +44,12 @@ _PAIR = {"success": 1, "stale": 2, "incomplete": 2, "partial": 3, "aborted": 3}
 _SYNC_LINE_LIMIT = 20
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ENTER_KEYS = (10, 13, curses.KEY_ENTER)
-_SORT_CYCLE = ["船隻名稱", "更新時間", "嚴重度", "裝置名稱"]
+_SORT_CYCLE = ["船隻名稱", "更新時間", "嚴重度", "裝置名稱", "版本"]
 _MODE_ARROW = {"download": "↓", "upload": "↑"}
-# 平坦模式的欄寬（顯示欄）：方向 船 IPC 元件 最後執行 檔案 成/略/失 距今 摘要
+# 版本欄寬：`0.10.0+811a5c3-dirty` 是目前最長的形狀（20 欄），塞不下就截斷 ——
+# 版號與 commit 前綴才是辨識用的，-dirty 被切掉仍看得出是哪一版。
+_VERSION_W = 16
+# 平坦模式的欄寬（顯示欄）：方向 船 IPC 元件 [版本] 最後執行 檔案 成/略/失 距今 摘要
 _FLAT_COLS = (1, 10, 6, 20, 11, 5, 9, 8)
 _FLAT_ALIGN = ("left", "left", "left", "left", "left", "right", "right", "left")
 _FLAT_GUTTER = "    "  # 對齊 _draw 的 depth-0 縮排("  ") + 狀態燈("●") + 空白
@@ -151,6 +154,9 @@ class TuiState:
     scroll: int = 0
     now: Optional[datetime] = None
     flat: bool = False                 # True＝平坦模式（不分群，全船隊一張表）
+    # 版本欄預設顯示：這是「哪艘船跑的是哪一版」最快的答案。窄終端機（80 欄）塞不下時
+    # 用 v 關掉 —— 分群模式關掉會把寬度還給摘要欄，平坦模式則整欄消失。
+    show_version: bool = True
     sort_key: str = _SORT_CYCLE[0]      # 見 _SORT_CYCLE
     sort_desc: bool = False            # 預設由 _SORT_CYCLE 首欄位升冪排序
     html_note: str = ""                # --html 每輪寫出的結果，顯示在第二行（""＝未啟用）
@@ -171,30 +177,50 @@ def _searchtext(d) -> str:
     ).lower()
 
 
-def _device_line(d, now: Optional[datetime]) -> str:
+def _version_str(rec) -> str:
+    """該次傳輸的程式碼版本；沒有就回破折號。
+
+    向上相容是硬需求：版本標記是後來才加的，而且要專案在自己的根目錄放 VERSION.json
+    才會有。所以「沒有版本」是正常狀態而不是錯誤 —— 舊 log、以及還沒宣告版號的專案，
+    這一欄都會是空的，畫面上以 — 呈現，不能因此讓列變形或報錯。
+    """
+    return (getattr(rec, "version_info", "") or "").strip() or "—"
+
+
+def _device_line(d, now: Optional[datetime], show_version: bool = True) -> str:
     rec = d.latest
     comp = pad_display(d.component, 20)
     last = pad_display(rec.started_at.strftime(TS_FMT) if rec.started_at else "—", 19)
     files = pad_display("—" if rec.file_count is None else str(rec.file_count), 5, "right")
     counts = pad_display(_counts_str(rec), 9, "right")
     age = pad_display(_humanize_age(d.last_seen, now) if now else "—", 9)
-    detail = fit_display(_detail_str(d), 60)[0]
-    return f"{comp} {last} {files} {counts} {age} {detail}"
+    # 版本欄的寬度是「跟摘要借的」而不是加在列尾：分群模式的列已經有 3 層縮排，
+    # 再長 17 欄就會把摘要推出畫面。借用之後整列總寬不變，關掉版本欄則原樣還回去。
+    version = pad_display(_version_str(rec), _VERSION_W) + " " if show_version else ""
+    detail = fit_display(_detail_str(d), 60 - (_VERSION_W + 1 if show_version else 0))[0]
+    return f"{comp} {version}{last} {files} {counts} {age} {detail}"
 
 
-def _flat_cells(cells) -> str:
-    """依 _FLAT_COLS 逐欄 pad 成固定顯示寬（CJK 安全）。
+def _flat_layout(show_version: bool):
+    """回傳 (欄寬, 對齊)；版本欄插在元件之後 —— 身分（船/IPC/元件）後面接版本才好讀。
 
-    表頭與內文共用這一個函式，欄位起點由 _FLAT_COLS 這個單一來源保證，
-    不必兩邊各算一次（同 CSV 檢視用 _CSV_PINNED_W 保證對齊的手法）。
+    表頭與內文都走這裡，欄位起點因此只有一個來源（同 CSV 檢視用 _CSV_PINNED_W 的手法）。
     """
-    fixed = " ".join(
-        pad_display(c, w, a) for c, w, a in zip(cells, _FLAT_COLS, _FLAT_ALIGN)
-    )
-    return f"{fixed} {cells[len(_FLAT_COLS)]}"  # 最後一欄（摘要）不設寬，由 _put 截斷
+    if not show_version:
+        return _FLAT_COLS, _FLAT_ALIGN
+    at = 4  # 方向 船 IPC 元件 之後
+    return (_FLAT_COLS[:at] + (_VERSION_W,) + _FLAT_COLS[at:],
+            _FLAT_ALIGN[:at] + ("left",) + _FLAT_ALIGN[at:])
 
 
-def _device_line_flat(item, now: Optional[datetime]) -> str:
+def _flat_cells(cells, show_version: bool = True) -> str:
+    """依版面逐欄 pad 成固定顯示寬（CJK 安全）。cells 需含版本欄（呼叫端負責取捨）。"""
+    cols, aligns = _flat_layout(show_version)
+    fixed = " ".join(pad_display(c, w, a) for c, w, a in zip(cells, cols, aligns))
+    return f"{fixed} {cells[len(cols)]}"  # 最後一欄（摘要）不設寬，由 _put 截斷
+
+
+def _device_line_flat(item, now: Optional[datetime], show_version: bool = True) -> str:
     """平坦模式的裝置列：沒有分群結構交代身分，故列本身要帶方向/船/IPC。
 
     方向必須顯示——同一台裝置的下載與上傳是兩筆 DeviceStatus，少了方向兩列會長得一樣。
@@ -202,27 +228,34 @@ def _device_line_flat(item, now: Optional[datetime]) -> str:
     """
     d = item.dev
     rec = d.latest
-    return _flat_cells([
+    cells = [
         _MODE_ARROW.get(rec.mode, "?"),
         item.vessel,
         item.ipc,
         d.component,
+    ]
+    if show_version:
+        cells.append(_version_str(rec))
+    return _flat_cells(cells + [
         rec.started_at.strftime("%m-%d %H:%M") if rec.started_at else "—",
         "—" if rec.file_count is None else str(rec.file_count),
         _counts_str(rec),
         _humanize_age(d.last_seen, now) if now else "—",
         _detail_str(d),
-    ])
+    ], show_version)
 
 
-def flat_header_line() -> str:
+def flat_header_line(show_version: bool = True) -> str:
     """平坦模式的欄名列（含 gutter，與內文同欄起點）。
 
     方向欄只有 1 欄寬，標籤得用半形寬的字：↕ 與資料的 ↓/↑ 同為東亞歧義字（寬 1），
     寫成全形的「向」會因為塞不進 1 欄而被 pad_display 整個丟掉。
     """
+    labels = ["↕", "船", "IPC", "元件"]
+    if show_version:
+        labels.append("版本")
     return _FLAT_GUTTER + _flat_cells(
-        ["↕", "船", "IPC", "元件", "最後執行", "檔案", "成/略/失", "距今", "摘要"]
+        labels + ["最後執行", "檔案", "成/略/失", "距今", "摘要"], show_version
     )
 
 
@@ -241,6 +274,11 @@ def sort_value(d, key: str):
         return d.device_name.casefold()
     if key == "船隻名稱":
         return (d.vessel or "（未分類）").casefold()
+    if key == "版本":
+        # 沒有版本的排在最後（"~" 大於所有 ASCII 可見字元）：升冪時想看的是「誰是哪一版」，
+        # 一整排破折號排在最前面只會擋路。不做版號的語意比較（0.10.0 vs 0.9.0 會排錯），
+        # 這一欄是拿來「把同版本的船聚在一起」的，不是拿來比新舊的。
+        return (getattr(d.latest, "version_info", "") or "~").casefold()
     return _SEVERITY.get(d.display_status, 0)  # 未知狀態→0，沿用資料層 .get(x, 0) 慣例
 
 
@@ -335,7 +373,9 @@ def flatten_tree(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
                 # 這只是 TUI 呈現，build_tree 給的順序不動（HTML/CLI 不受影響）
                 for d in sort_devices(dvs, state.sort_key, state.sort_desc):
                     dkey = ("D", m.mode, v.name, ip.name, d.component)
-                    rows.append(Row("device", 3, dkey, _device_line(d, now), d.display_status, d))
+                    rows.append(Row("device", 3, dkey,
+                                    _device_line(d, now, state.show_version),
+                                    d.display_status, d))
     return rows
 
 
@@ -380,7 +420,7 @@ def flatten_flat(tree, state: TuiState, now: Optional[datetime]) -> List[Row]:
             "device",
             0,
             ("D", it.mode, it.vessel, it.ipc, it.dev.component),
-            _device_line_flat(it, now),
+            _device_line_flat(it, now, state.show_version),
             it.dev.display_status,
             it.dev,
         )
@@ -481,6 +521,10 @@ def toggle_problem(state: TuiState) -> None:
     state.only_problem = not state.only_problem
 
 
+def toggle_version(state: TuiState) -> None:
+    state.show_version = not state.show_version
+
+
 def set_query(state: TuiState, q: str) -> None:
     state.query = q
     state.scroll = 0
@@ -573,6 +617,8 @@ def key_action(ch: int) -> Optional[str]:
         return "collapse_all"
     if ch == ord("p"):
         return "only_problem"
+    if ch == ord("v"):
+        return "toggle_version"
     if ch == ord("m"):
         return "cycle_mode"
     if ch == ord("s"):
@@ -827,10 +873,12 @@ _HELP_LINES = [
     "看明細    在裝置列按 Enter；明細再按 Enter 看該筆 CSV 原始資料",
     "CSV檢視   ↑↓/PgUp/PgDn/g/G 捲動、←→ 水平捲動、0 復位、s/S 排序、q/Esc 返回",
     "檢視      f 切換 平坦/分群（平坦＝全船隊一張表，忽略 方向/船/IPC 分群）",
-    "排序      o 循環欄位（船隻名稱 / 更新時間 / 嚴重度 / 裝置名稱）、O 切換升降冪",
+    "排序      o 循環欄位（船隻名稱 / 更新時間 / 嚴重度 / 裝置名稱 / 版本）、O 切換升降冪",
     "          預設 船隻名稱↓（分群模式下這欄排的是船群，其餘欄位排裝置列）",
     "          更新時間↑ 最久未更新在前（找失聯裝置）",
     "全部      E 全部展開、C 全部收合（僅分群模式看得到效果）",
+    "版本      v 顯示/隱藏版本欄（該次傳輸的程式碼版本；沒宣告版號的專案顯示 —）",
+    "          版本排序是把同版本的船聚在一起，不是比新舊（0.10.0 會排在 0.9.0 前）",
     "過濾      / 搜尋（Esc 清除）、m 循環方向、s 循環狀態、p 只看異常",
     "其他      r 立即重載、? 說明、q 離開",
 ]
@@ -972,9 +1020,9 @@ def footer_hint(state: TuiState) -> str:
     """底部提示（純函式）：平坦模式沒有群組，展開收合的提示換成排序。"""
     if state.flat:
         return (" ↑↓移動  Enter明細  f分群  o欄位/O升降  /搜尋  m方向  s狀態"
-                "  p異常  r重載  ?說明  q離開")
+                "  p異常  v版本  r重載  ?說明  q離開")
     return (" ↑↓移動  Enter開合/明細  ←→收展  E/C全展收  f平坦  o/O排序"
-            "  /搜尋  m方向  s狀態  p異常  r重載  ?說明  q離開")
+            "  /搜尋  m方向  s狀態  p異常  v版本  r重載  ?說明  q離開")
 
 
 def _draw(stdscr, state: TuiState, rows: List[Row], tree, watch: float) -> None:
@@ -1004,7 +1052,8 @@ def _draw(stdscr, state: TuiState, rows: List[Row], tree, watch: float) -> None:
 
     top, height = body_top(maxy, state), body_height(maxy, state)
     if state.flat and maxy > 3:  # 平坦模式是表格，補一行凍結欄名
-        _addstr(stdscr, 2, 0, fit_display(flat_header_line(), width)[0], curses.A_UNDERLINE)
+        _addstr(stdscr, 2, 0, fit_display(flat_header_line(state.show_version), width)[0],
+                curses.A_UNDERLINE)
     if height < 1:
         stdscr.refresh()
         return
@@ -1352,6 +1401,8 @@ def _main_loop(stdscr, args):
             toggle_sort_dir(state)
         elif act == "only_problem":
             toggle_problem(state)
+        elif act == "toggle_version":
+            toggle_version(state)
         elif act == "cycle_mode":
             cycle_mode(state)
         elif act == "cycle_status":
