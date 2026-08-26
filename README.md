@@ -280,6 +280,40 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
 - 船舶資訊檔路徑可用環境變數 `VESSEL_INFO_PATH` 覆蓋（測試或特殊部署用）。
 - **注意**：GUI 載入設定檔後，畫面顯示的是展開後的實際值；「匯出設定檔」也會寫出展開後的值（佔位符不保留）。要維護佔位符請直接編輯 JSON 檔。另外密碼等欄位若本身含 `{...}` 字樣會被誤認為佔位符而報錯，屬罕見情況，請避免在設定值中使用大括號。
 
+### 保留字佔位符：`{nvme}`（NVMe 資料碟掛載點）
+
+除了查 `vessel_basic_info.json` 的佔位符之外，還有一個**保留字**佔位符，它的值不是查表得來，而是載入設定檔時**向系統現場探測**：
+
+| 佔位符 | 展開成 |
+| --- | --- |
+| `{nvme}` | NVMe 資料碟 `/dev/nvme0n1` 目前的掛載點，例如 `/media/mic-733ao/09ed0ec0-…` |
+
+```json
+{
+  "local_path": "{nvme}/wanhai_nssms/sftp_data"
+}
+```
+
+- **為什麼是裝置名而不是掛載點**：掛載是開機時由 `scheduler/reboot_launcher.sh` 用 `udisksctl mount -b /dev/nvme0n1` 做的，掛載點由 udisks 決定（`/media/$USER/$UUID`），裡頭含登入帳號與檔案系統 UUID —— 換使用者或換一顆盤就變。裝置名反而是全船隊一致的，所以設定檔寫裝置這個「錨」，執行時用 `findmnt -n -o TARGET -S /dev/nvme0n1` 反查掛載點。手法與 `scheduler/reboot_script/start_web_docker.sh` 相同。
+- **每次執行都重新探測**，不快取到檔案裡。記錄下來的掛載點會過期，而「記錄說掛在這、實際沒掛」是最難查的狀態。
+- **探不到就中止該任務，不會退回主碟**。資料碟沒掛載時那條路徑仍是根檔案系統上一個可以建出來的目錄，若默默改用主碟，下載會安靜成功並把開機碟（船機是 eMMC）塞爆。錯誤訊息會指明是哪顆裝置沒掛載，並附上 `udisksctl mount -b /dev/nvme0n1` 的修復指令。
+- **中止只影響該筆任務**：`run_all_downloads.py` / `run_all_uploads.py` 每份設定檔各起一個子行程，前一個成功或失敗都會繼續跑下一個；scheduler 的 `reboot_script/start_*.sh` 收到非零離開碼也只記錄「以既有版本繼續」，服務照樣啟動。
+- 保留字**優先於** `vessel_basic_info.json` 內的同名 key。
+- 設定檔沒用到 `{nvme}` 時完全不會做探測。
+- 裝置可用環境變數 `SFTP_NVME_DEVICE` 覆蓋（測試或特殊部署用）。
+
+### 本地端路徑不支援 `~` 與 `$VAR`
+
+`local_path`、`ignore_file`、`log_dir`、`key_file` 這四個**本地端**路徑欄位若寫了 `~` 或 `$HOME` 這類 shell 語法，載入時會直接報錯中止（`ConfigPathError`）。
+
+本工具不做 shell 展開，而 `~` / `$HOME` 都**不是**絕對路徑，會被當成相對於 `share/sftp_transfer` 的相對路徑，於是真的建出名字叫 `~` 或 `$HOME` 的目錄並把檔案下載進去 —— 沒有任何錯誤訊息，只是東西全放錯位置。所以這裡選擇當場拒絕。請改用：
+
+- **相對路徑**（相對於 `share/sftp_transfer`，例如 `"local_path": "."`、`"ignore_file": "config/xxx_ignore.txt"`）—— 所有 `script/run_*.sh` 都會先 `cd "$BASE_DIR"`，所以相對路徑是機器無關的
+- **絕對路徑**
+- 資料碟上的位置請用 `{nvme}`（見上）
+
+`remote_path` 刻意**不受**此限制：那是 SFTP 伺服器上的路徑，不能用本機的家目錄去解讀它。
+
 ---
 
 ## 【下載忽略設定檔（ignore_file）】

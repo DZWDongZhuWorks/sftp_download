@@ -1,7 +1,7 @@
 {
-  "version": "0.8.0",
+  "version": "0.9.0",
   "date": "2026-08-26",
-  "notes": "岸端 monitor 的主清單與 HTML 報告顯示程式碼版本",
+  "notes": "新增 {nvme} 保留字佔位符：設定檔可指向 NVMe 資料碟，執行時探測掛載點，沒掛載則中止該任務",
   "stamp_exclude": [
     "*.whl"
   ]
