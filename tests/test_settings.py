@@ -312,3 +312,153 @@ class TestRunScriptCwdContract:
             "這些 run_*.sh 沒有 `cd \"$BASE_DIR\"`，相對路徑會相對於呼叫者的 CWD "
             "而把檔案放到錯誤位置：" + ", ".join(missing)
         )
+
+
+class TestNvmePlaceholder:
+    """{nvme} 保留字佔位符：值由執行時探測產生，不是去船舶資訊檔查表。
+
+    全部注入探測結果，不依賴本機磁碟狀態 —— 否則真實掛載點裡的檔案系統 UUID 會跑進
+    斷言，換一顆盤或換一台機器就紅。
+    """
+
+    def test_expands_to_probed_mount_point(self):
+        with patch.object(settings_module, "_probe_nvme_mount", return_value="/media/u/UUID"):
+            result = settings_module.resolve_placeholders({"local_path": "{nvme}/sftp_data"})
+        assert result["local_path"] == "/media/u/UUID/sftp_data"
+
+    def test_unmounted_raises_with_device_and_remediation(self, monkeypatch):
+        """探不到就中止。訊息是這筆失敗唯一的載體。
+
+        PlaceholderError 發生在 main.py 建 logger **之前**，所以不會產生 SFTP log CSV、
+        岸端 monitor 看不到；stderr 是唯一線索，因此訊息必須自己講完「哪顆盤、怎麼修」。
+        """
+        monkeypatch.setenv(settings_module.NVME_DEVICE_ENV, "/dev/does-not-exist")
+        with patch.object(settings_module, "_probe_nvme_mount", return_value=None):
+            with pytest.raises(settings_module.PlaceholderError) as exc:
+                settings_module.resolve_placeholders({"local_path": "{nvme}/x"})
+        message = str(exc.value)
+        assert "/dev/does-not-exist" in message
+        assert "udisksctl mount -b" in message
+        assert "local_path" in message
+
+    def test_no_nvme_placeholder_does_not_probe(self):
+        """沒用到 {nvme} 就不該 fork findmnt（比照「沒佔位符不讀船舶資訊檔」）。"""
+        with patch.object(settings_module, "_probe_nvme_mount") as probe:
+            settings_module.resolve_placeholders({"local_path": ".", "port": 22})
+        probe.assert_not_called()
+
+    def test_probed_once_per_call(self):
+        with patch.object(settings_module, "_probe_nvme_mount", return_value="/mnt/d") as probe:
+            result = settings_module.resolve_placeholders({
+                "local_path": "{nvme}/a",
+                "log_dir": "{nvme}/logs",
+                "ignore_file": "{nvme}/ig.txt",
+            })
+        assert probe.call_count == 1
+        assert result["log_dir"] == "/mnt/d/logs"
+
+    def test_reserved_word_wins_over_vessel_info_key(self, tmp_path, monkeypatch):
+        """船舶資訊檔就算有 nvme 這個 key 也不能蓋掉保留字。
+
+        身分檔是人手維護的宣告，探測是機器現況；現況優先，否則一個手誤的 key 會把
+        全船隊導到一條不存在的路徑上。
+        """
+        path = tmp_path / "vessel_basic_info.json"
+        path.write_text('{"vsl_name": "WH289", "nvme": "/wrong"}', encoding="utf-8")
+        monkeypatch.setenv("VESSEL_INFO_PATH", str(path))
+        with patch.object(settings_module, "_probe_nvme_mount", return_value="/mnt/right"):
+            result = settings_module.resolve_placeholders({"local_path": "{nvme}/x"})
+        assert result["local_path"] == "/mnt/right/x"
+
+    def test_resolved_inside_list_elements(self):
+        # local_path 可以是陣列（與 remote_path 逐一配對），每個元素都要展開。
+        with patch.object(settings_module, "_probe_nvme_mount", return_value="/mnt/d"):
+            result = settings_module.resolve_placeholders({"local_path": ["plain", "{nvme}/x"]})
+        assert result["local_path"] == ["plain", "/mnt/d/x"]
+
+    def test_mixed_with_vessel_info_placeholders(self, tmp_path, monkeypatch):
+        path = tmp_path / "vessel_basic_info.json"
+        path.write_text('{"vsl_name": "WH289"}', encoding="utf-8")
+        monkeypatch.setenv("VESSEL_INFO_PATH", str(path))
+        with patch.object(settings_module, "_probe_nvme_mount", return_value="/mnt/d"):
+            result = settings_module.resolve_placeholders({"local_path": "{nvme}/{vsl_name}/x"})
+        assert result["local_path"] == "/mnt/d/WH289/x"
+
+    def test_expansion_passes_shell_guard(self, tmp_path):
+        """展開結果是絕對路徑，通過 _check_local_paths（它刻意排在替換之後）。"""
+        path = tmp_path / "c.json"
+        path.write_text(json.dumps({"local_path": "{nvme}/data"}), encoding="utf-8")
+        with patch.object(settings_module, "_probe_nvme_mount", return_value="/media/u/UUID"):
+            result = settings_module.load_settings(path)
+        assert result == {"local_path": "/media/u/UUID/data"}
+
+    def test_unknown_key_error_mentions_reserved_words(self, tmp_path, monkeypatch):
+        """打錯保留字（{nvem}）時，訊息要把保留字列出來，否則無從得知有這個字。"""
+        path = tmp_path / "vessel_basic_info.json"
+        path.write_text('{"vsl_name": "WH289"}', encoding="utf-8")
+        monkeypatch.setenv("VESSEL_INFO_PATH", str(path))
+        with pytest.raises(settings_module.PlaceholderError, match="nvme"):
+            settings_module.resolve_placeholders({"local_path": "{nvem}/x"})
+
+
+class TestProbeNvmeMount:
+    """探測本身：findmnt 的呼叫方式，以及各種問不到都回 None（由呼叫方統一報錯）。"""
+
+    def _completed(self, returncode=0, stdout=""):
+        return MagicMock(returncode=returncode, stdout=stdout)
+
+    def test_returns_first_mount_point(self, monkeypatch):
+        # 同一顆裝置可能列出多個掛載點（bind mount），取第一個，與
+        # scheduler/reboot_script/start_web_docker.sh 的 `| head -1` 一致。
+        monkeypatch.setenv(settings_module.NVME_DEVICE_ENV, "/dev/nvme9n1")
+        completed = self._completed(stdout="/media/u/UUID\n/mnt/bind\n")
+        with patch.object(settings_module.subprocess, "run", return_value=completed) as run:
+            assert settings_module._probe_nvme_mount() == "/media/u/UUID"
+        assert run.call_args[0][0] == [
+            "findmnt", "-n", "-o", "TARGET", "-S", "/dev/nvme9n1",
+        ]
+
+    def test_nonzero_returncode_is_none(self, monkeypatch):
+        monkeypatch.delenv(settings_module.NVME_DEVICE_ENV, raising=False)
+        with patch.object(settings_module.subprocess, "run",
+                          return_value=self._completed(returncode=1)):
+            assert settings_module._probe_nvme_mount() is None
+
+    def test_blank_output_is_none(self, monkeypatch):
+        monkeypatch.delenv(settings_module.NVME_DEVICE_ENV, raising=False)
+        with patch.object(settings_module.subprocess, "run",
+                          return_value=self._completed(stdout="\n   \n")):
+            assert settings_module._probe_nvme_mount() is None
+
+    def test_findmnt_missing_is_none(self, monkeypatch):
+        # 非 Linux 或極簡環境沒有 findmnt。當成探測不到，不要讓 OSError 漏出去。
+        monkeypatch.delenv(settings_module.NVME_DEVICE_ENV, raising=False)
+        with patch.object(settings_module.subprocess, "run", side_effect=OSError("nope")):
+            assert settings_module._probe_nvme_mount() is None
+
+    def test_default_device_matches_reboot_launcher(self, monkeypatch):
+        """預設裝置必須與 scheduler/reboot_launcher.sh 掛載的那顆一致。
+
+        那支開機時跑 `udisksctl mount -b /dev/nvme0n1`；兩邊對不上的話，設定檔會去問
+        一顆沒人掛的盤。
+        """
+        monkeypatch.delenv(settings_module.NVME_DEVICE_ENV, raising=False)
+        assert settings_module.NVME_DEVICE == "/dev/nvme0n1"
+        with patch.object(settings_module.subprocess, "run",
+                          return_value=self._completed(stdout="/m\n")) as run:
+            settings_module._probe_nvme_mount()
+        assert run.call_args[0][0][-1] == "/dev/nvme0n1"
+
+    def test_uses_py36_safe_subprocess_kwargs(self, monkeypatch):
+        """船端 Bionic 是 py3.6：只能用 universal_newlines=，不能用 3.7 的 text 參數。
+
+        test_offline_deploy.py 的靜態掃描已經守著字面寫法，這裡守的是**行為** ——
+        真的有把解碼參數傳下去，否則 stdout 會是 bytes，splitlines 出來的元素比不過字串。
+        """
+        monkeypatch.delenv(settings_module.NVME_DEVICE_ENV, raising=False)
+        with patch.object(settings_module.subprocess, "run",
+                          return_value=self._completed(stdout="/m\n")) as run:
+            settings_module._probe_nvme_mount()
+        kwargs = run.call_args[1]
+        assert kwargs["universal_newlines"] is True
+        assert "text" not in kwargs

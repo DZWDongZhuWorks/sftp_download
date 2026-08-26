@@ -16,6 +16,18 @@ VESSEL_INFO_PATH = Path(__file__).resolve().parent.parent / ".env" / "vessel_bas
 
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
 
+# NVMe 資料碟的**裝置名**。刻意寫死裝置而不是掛載點：掛載是 scheduler/reboot_launcher.sh
+# 開機時用 `udisksctl mount -b /dev/nvme0n1` 做的，掛載點由 udisks 決定
+# （/media/$USER/$UUID），裡頭含登入帳號與檔案系統 UUID —— 換使用者或換盤就變，寫進
+# 全船隊共用的 config/ 一定過期。裝置名反而是全船隊一致的錨（reboot_launcher 就是照
+# 這個名字掛的），所以設定檔寫錨、執行時反查掛載點。
+# 這個手法與 scheduler/reboot_script/start_web_docker.sh 完全相同（那支也是
+# findmnt -n -o TARGET -S /dev/nvme0n1），web 專案搬上資料碟時就是這樣處理的。
+NVME_DEVICE = "/dev/nvme0n1"
+
+# 可用環境變數覆蓋裝置（測試或特殊部署用），慣例同 VESSEL_INFO_PATH。
+NVME_DEVICE_ENV = "SFTP_NVME_DEVICE"
+
 # 本地端路徑欄位。這些值由本機的檔案系統解讀，**相對路徑相對於 CWD**，而所有
 # script/run_*.sh 都會先 `cd "$BASE_DIR"`（= share/sftp_transfer），所以寫相對路徑
 # 就是機器無關的。remote_path 刻意不在此列：那是 SFTP 伺服器上的路徑,不能用本機
@@ -120,29 +132,96 @@ def _load_vessel_info():
     return {key: str(value) for key, value in info.items()}
 
 
+def _probe_nvme_mount():
+    """回傳 NVMe 資料碟目前的掛載點，沒掛載（或問不到）回 None。
+
+    每次執行都問系統，而不是把掛載點記在某個檔案裡。理由是記錄會過期，而「記錄說掛在
+    這、實際沒掛」是最難查的狀態：掛載點不在時那條路徑仍是**根檔案系統**上一個可以建
+    出來的目錄，於是下載會安靜地成功，並把開機碟（船機是 eMMC，只有幾十 GB）塞爆。
+    """
+    device = os.environ.get(NVME_DEVICE_ENV) or NVME_DEVICE
+    try:
+        proc = subprocess.run(
+            ["findmnt", "-n", "-o", "TARGET", "-S", device],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            # 船端 Bionic 是 py3.6，只能用 universal_newlines=（3.7 才有 text 參數）。
+            universal_newlines=True,
+        )
+    except OSError:
+        # findmnt 不存在（非 Linux 或極簡環境）。當成探測不到，由呼叫方統一報錯。
+        return None
+    if proc.returncode != 0:
+        return None
+    # 同一個裝置可能列出多個掛載點（bind mount），取第一個 ——
+    # 與 start_web_docker.sh 的 `| head -1` 一致。
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+def _resolve_nvme(field):
+    """{nvme} 的值：現場探測到的掛載點。探不到就中止，不退回任何替代路徑。
+
+    刻意不 fallback 到主碟：見 _probe_nvme_mount 的說明，以及
+    scheduler/reboot_script/start_web_docker.sh 的檔頭 —— 資料碟沒掛載時回報「正常」
+    等於謊報，而那正是東西找不到時最可能的原因。
+    """
+    mount = _probe_nvme_mount()
+    if mount:
+        return mount
+    device = os.environ.get(NVME_DEVICE_ENV) or NVME_DEVICE
+    raise PlaceholderError(
+        f"設定檔欄位 {field} 用了 {{nvme}}，但 {device} 沒有掛載"
+        f"（findmnt 問不到掛載點）。這不是設定檔寫錯，是這台機器上的資料碟現在不可用；"
+        f"本任務已中止，同一批的其他任務不受影響。"
+        f"開機時本應由 scheduler/reboot_launcher.sh 掛好，手動掛載："
+        f"udisksctl mount -b {device}"
+    )
+
+
+# 保留字佔位符：值不是去船舶資訊檔查表，而是執行時向系統探測。
+# 優先於 vessel_basic_info.json 的同名 key。
+_RESERVED_RESOLVERS = {"nvme": _resolve_nvme}
+
+
 def resolve_placeholders(settings):
     """把設定值字串中的 {vsl_name}、{ipc} 等佔位符換成 vessel_basic_info.json 的對應值。
 
     - 處理字串值與字串陣列（如 remote_path 的路徑陣列）內的每個元素，其他型別原樣保留。
-    - 完全沒有佔位符時不會去讀船舶資訊檔（該檔可以不存在）。
-    - 佔位符無法解析（檔案不存在／缺少 key）時拋出 PlaceholderError，
+    - 完全沒有佔位符時不會去讀船舶資訊檔（該檔可以不存在），也不會做任何探測。
+    - 保留字佔位符（見 _RESERVED_RESOLVERS，目前只有 {nvme}）的值由執行時探測產生，
+      優先於船舶資訊檔的同名 key；每個保留字在一次呼叫內只探測一次。
+    - 佔位符無法解析（檔案不存在／缺少 key／探測不到）時拋出 PlaceholderError，
       避免把 "{vsl_name}" 這種字面文字當成路徑上傳到伺服器。
     """
     vessel_info = None
+    reserved = {}
+
+    def resolve_name(field, name):
+        nonlocal vessel_info
+        if name in _RESERVED_RESOLVERS:
+            if name not in reserved:
+                reserved[name] = _RESERVED_RESOLVERS[name](field)
+            return reserved[name]
+        if vessel_info is None:
+            vessel_info = _load_vessel_info()
+        if name not in vessel_info:
+            raise PlaceholderError(
+                f"設定檔欄位 {field} 的佔位符 {{{name}}} 在船舶資訊檔中找不到對應值"
+                f"（可用的 key：{', '.join(sorted(vessel_info)) or '（無）'}；"
+                f"保留字：{', '.join(sorted(_RESERVED_RESOLVERS))}）"
+            )
+        return vessel_info[name]
 
     def resolve_text(field, value):
-        nonlocal vessel_info
-        for name in _PLACEHOLDER.findall(value):
-            if vessel_info is None:
-                vessel_info = _load_vessel_info()
-            if name not in vessel_info:
-                raise PlaceholderError(
-                    f"設定檔欄位 {field} 的佔位符 {{{name}}} 在船舶資訊檔中找不到對應值"
-                    f"（可用的 key：{', '.join(sorted(vessel_info)) or '（無）'}）"
-                )
-        if vessel_info:
-            value = _PLACEHOLDER.sub(lambda m: vessel_info[m.group(1)], value)
-        return value
+        names = _PLACEHOLDER.findall(value)
+        if not names:
+            return value
+        values = {name: resolve_name(field, name) for name in names}
+        return _PLACEHOLDER.sub(lambda m: values[m.group(1)], value)
 
     resolved = {}
     for field, value in settings.items():
