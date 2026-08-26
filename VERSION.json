@@ -1,7 +1,7 @@
 {
-  "version": "0.7.1",
+  "version": "0.8.0",
   "date": "2026-08-26",
-  "notes": "本專案自己的版號宣告上線：自我更新的傳輸 log 也帶得上版本",
+  "notes": "岸端 monitor 的主清單與 HTML 報告顯示程式碼版本",
   "stamp_exclude": [
     "*.whl"
   ]
