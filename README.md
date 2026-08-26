@@ -397,7 +397,7 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 
 `main.py` 的 `run_cli()` 會檢查待傳輸專案（`local_path`）的**根目錄有沒有 `VERSION.json`**：
 
-- **有**（目前只有 radar）：
+- **有**（撰文時：radar、scheduler、sftp_transfer 自己、SHM-stream-manager、device_monitor —— 以各專案根目錄實際有沒有那個檔為準，這份清單只是當下狀態）：
   - **上傳**：先產生 `<專案>/VERSION.stamp.json` —— 內容是宣告的版號 + git commit/branch/dirty + **每個會上傳的檔案的 sha256**；接著在呼叫端沒有明確指定 `--version-info` 時，把版本字串（例如 `0.4.0+8154418`）填進 log 的 `version_info` 欄。
   - **下載**：只讀不寫，取到的是「下載前」的版本 —— 那正是要記進 log 的。
 - **沒有**：完全照舊，一行都不會執行。
