@@ -386,6 +386,8 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 
 **manifest 就是「這次真正會上傳的檔案」**：`version_stamp.py` 直接沿用 `pack_upload.build_archive_plan()`，也就是 `SFTPUploader` 的選檔邏輯加上同一份 `ignore_file`。所以不存在「第二份排除清單要跟 upload ignore 同步」的問題。
 
+> **本工具自己也吃這一套**：`sftp_transfer/VERSION.json` 宣告自己的版號（與 git tag 對齊），所以自我更新（`run_sftp_self_update.sh`）的 log 也會帶上版本。`stamp_exclude` 只列了 `*.whl` —— `deploy/` 底下的 47 個離線輪子約 25 MB，是安裝期產物，不算程式碼身分；扣掉後 manifest 是 125 個檔、約 1.9 MB。
+
 **為什麼掛在 `run_cli()`** 而不是某支 `run_*.sh`：發布與更新有很多條路（`run_all_uploads.py`、`run_selected_transfers.py`、`run_radar_*.sh`、手動 `main.py --cli`），`run_cli()` 是它們共同的收口；只在單一腳本裡處理，換一條路走就靜默失去版本資訊。
 
 其餘相關：
