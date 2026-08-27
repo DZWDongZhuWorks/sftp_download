@@ -104,6 +104,48 @@ def test_parse_aborted(tmp_path):
     assert rec.abort_reason == "帳號或密碼錯誤"
 
 
+def test_parse_tagged_abort_keeps_legacy_anchor_and_diagnostic_fields(tmp_path):
+    message = (
+        '[RUN_ABORTED] 任務發生未處理錯誤 direction="download" '
+        'error="OSError: OSError(\\\'disk full\\\')" action="abort" '
+        '=== 任務中止：OSError: OSError(\'disk full\') ==='
+    )
+    p = write_log(
+        tmp_path / "D_dev_20260727_040100.csv",
+        "CLINK_IPC-1_scheduler",
+        [
+            ("2026-07-27 04:01:00", "INFO", "=== SFTP 下載任務開始 ==="),
+            ("2026-07-27 04:01:02", "ERROR", message),
+        ],
+    )
+
+    rec = parse_log_file(p)
+
+    assert rec.status == "aborted"
+    assert rec.abort_reason == "OSError: OSError('disk full')"
+    assert rec.errors == [message]
+
+
+def test_diagnostic_warning_is_preserved_for_future_analysis(tmp_path):
+    warning = (
+        '[RESUME_REJECTED] 既有暫存檔無法接續 direction="download" '
+        'reason="checkpoint_offset_mismatch" partial_bytes=20 checkpoint_bytes=10 action="restart"'
+    )
+    p = write_log(
+        tmp_path / "D_dev_20260727_040200.csv",
+        "CLINK_IPC-1_scheduler",
+        _download_rows(extra=[
+            ("2026-07-27 04:02:01", "WARNING", warning),
+            ("2026-07-27 04:02:02", "INFO", "=== 下載任務結束：成功 1，略過 0，失敗 0 ==="),
+        ]),
+    )
+
+    rec = parse_log_file(p)
+
+    assert rec.status == "success"
+    assert rec.warnings == [warning]
+
+
 def test_parse_incomplete(tmp_path):
     p = write_log(
         tmp_path / "D_dev_20260727_050000.csv",
@@ -628,4 +670,3 @@ def test_run_record_version_info_defaults_to_empty():
     """RunRecord 給了預設值 —— 既有的建構呼叫端不必跟著改（向上相容）。"""
     rec = RunRecord(path=Path("x.csv"), device_name="d", mode="download")
     assert rec.version_info == ""
-

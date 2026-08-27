@@ -248,7 +248,9 @@ class TestUploadOneFileUpdated:
 
 
 class TestUploadOneFileResume:
-    def test_resumes_from_partial_remote_when_prefix_verified(self, uploader_factory, fake_sftp_factory, tmp_path):
+    def test_resumes_from_partial_remote_when_prefix_verified(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
         content = b"Z" * (up.CHUNK_SIZE * 3)
         partial = up.CHUNK_SIZE  # 已上傳 1/3
         local = tmp_path / "big.bin"
@@ -264,12 +266,19 @@ class TestUploadOneFileResume:
             }
         }
 
-        result = d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+        with caplog.at_level(logging.INFO):
+            result = d._upload_one_file(local, "big.bin", "/remote", tmp_path)
 
         assert result == "uploaded"
         assert d.sftp.files["/remote/big.bin"] == content
+        message = next(r.message for r in caplog.records if "[RESUME_ACCEPTED]" in r.message)
+        assert 'direction="upload"' in message
+        assert f"resume_offset={partial}" in message
+        assert f"remaining_bytes={len(content) - partial}" in message
 
-    def test_reupload_from_scratch_when_prefix_hash_mismatches(self, uploader_factory, fake_sftp_factory, tmp_path):
+    def test_reupload_from_scratch_when_prefix_hash_mismatches(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
         content = b"Q" * (up.CHUNK_SIZE * 2)
         partial = up.CHUNK_SIZE
         local = tmp_path / "big.bin"
@@ -286,10 +295,71 @@ class TestUploadOneFileResume:
             }
         }
 
-        result = d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+        with caplog.at_level(logging.WARNING):
+            result = d._upload_one_file(local, "big.bin", "/remote", tmp_path)
 
         assert result == "uploaded"
         assert d.sftp.files["/remote/big.bin"] == content
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="checkpoint_hash_mismatch"' in message
+        assert f"remote_size={partial}" in message
+        assert f"checkpoint_bytes={partial}" in message
+        assert 'expected_hash_prefix="deadbeef"' in message
+        assert 'actual_hash_prefix=' in message
+        assert 'action="overwrite"' in message
+
+    def test_offset_mismatch_reports_both_remote_and_checkpoint_sizes(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        content = b"R" * (up.CHUNK_SIZE * 3)
+        remote_size = up.CHUNK_SIZE
+        checkpoint_bytes = up.CHUNK_SIZE * 2
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/big.bin": content[:remote_size]})
+        d._manifest = {
+            "big.bin": {
+                "size": len(content),
+                "mtime": _mtime(local),
+                "local_sha256": hashlib.sha256(content[:checkpoint_bytes]).hexdigest(),
+                "local_bytes": checkpoint_bytes,
+            }
+        }
+
+        with caplog.at_level(logging.WARNING):
+            result = d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        assert result == "uploaded"
+        assert d.sftp.files["/remote/big.bin"] == content
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="checkpoint_offset_mismatch"' in message
+        assert f"remote_size={remote_size}" in message
+        assert f"checkpoint_bytes={checkpoint_bytes}" in message
+
+    def test_missing_checkpoint_hash_has_its_own_reason(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        content = b"H" * (up.CHUNK_SIZE * 2)
+        partial = up.CHUNK_SIZE
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/big.bin": content[:partial]})
+        d._manifest = {
+            "big.bin": {
+                "size": len(content),
+                "mtime": _mtime(local),
+                "local_bytes": partial,
+            }
+        }
+
+        with caplog.at_level(logging.WARNING):
+            d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="checkpoint_hash_missing"' in message
+        assert "checkpoint_hash_present=false" in message
 
 
 class TestUploadOneFileCheckpointing:
@@ -305,6 +375,82 @@ class TestUploadOneFileCheckpointing:
         manifest = d._load_manifest(tmp_path)
         assert manifest["big.bin"]["local_bytes"] == len(content)
         assert manifest["big.bin"]["local_sha256"] == hashlib.sha256(content).hexdigest()
+
+    def test_transfer_error_logs_saved_checkpoint_context(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        content = b"E" * (up.CHUNK_SIZE * 3)
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        sftp = fake_sftp_factory(files={})
+        original_open = sftp.open
+        writes = {"n": 0}
+
+        def flaky_open(path, mode="rb"):
+            fake_file = original_open(path, mode)
+            original_write = fake_file.write
+
+            def flaky_write(chunk):
+                writes["n"] += 1
+                if writes["n"] == 2:
+                    raise OSError("simulated dropped connection")
+                return original_write(chunk)
+
+            fake_file.write = flaky_write
+            return fake_file
+
+        sftp.open = flaky_open
+        d.sftp = sftp
+
+        with caplog.at_level(logging.WARNING), pytest.raises(OSError):
+            d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        manifest = d._load_manifest(tmp_path)["big.bin"]
+        assert manifest["local_bytes"] == up.CHUNK_SIZE
+        message = next(r.message for r in caplog.records if "[CHECKPOINT_SAVED]" in r.message)
+        assert 'direction="upload"' in message
+        assert 'reason="transfer_error"' in message
+        assert f"offset={up.CHUNK_SIZE}" in message
+        assert "manifest_saved=true" in message
+
+    def test_sigterm_logs_signal_and_checkpoint_context(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        content = b"C" * (up.CHUNK_SIZE * 3)
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        sftp = fake_sftp_factory(files={})
+        original_open = sftp.open
+        writes = {"n": 0}
+
+        def cancelling_open(path, mode="rb"):
+            fake_file = original_open(path, mode)
+            original_write = fake_file.write
+
+            def cancelling_write(chunk):
+                writes["n"] += 1
+                if writes["n"] == 2:
+                    raise up.TransferCancelled(15)
+                return original_write(chunk)
+
+            fake_file.write = cancelling_write
+            return fake_file
+
+        sftp.open = cancelling_open
+        d.sftp = sftp
+
+        with caplog.at_level(logging.WARNING), pytest.raises(up.TransferCancelled):
+            d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        manifest = d._load_manifest(tmp_path)["big.bin"]
+        assert manifest["local_bytes"] == up.CHUNK_SIZE
+        message = next(r.message for r in caplog.records if "[CHECKPOINT_SAVED]" in r.message)
+        assert 'reason="cancelled"' in message
+        assert "signal=15" in message
+        assert f"offset={up.CHUNK_SIZE}" in message
+        assert "manifest_saved=true" in message
 
 
 class TestRun:

@@ -14,8 +14,8 @@ import sys
 from pathlib import Path
 
 import version_stamp
-from downloader import SFTPDownloader, TransferCancelled, create_logger
-from settings import PlaceholderError, load_settings
+from downloader import SFTPDownloader, TransferCancelled, create_logger, diagnostic_message
+from settings import SETTINGS_PATH, PlaceholderError, load_settings
 from uploader import SFTPUploader
 
 DEFAULT_LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -169,6 +169,28 @@ def run_cli(args):
     })
 
     logger, log_file = create_logger(log_dir, device_name, version_info, mode=mode)
+    logger.info(diagnostic_message(
+        "RUN_CONTEXT",
+        "傳輸設定已解析",
+        mode=mode,
+        config_path=str(Path(args.config).resolve()) if args.config else str(SETTINGS_PATH),
+        host=host,
+        port=port,
+        username=username,
+        remote_path=remote_path,
+        local_path=local_path,
+        auth="key" if key_file else "password",
+        auto_reconnect=auto_reconnect,
+        resume=resume,
+        wait_for_network=wait_for_network,
+        recursive=recursive,
+        ignore_file=ignore_file,
+        retry_count=retry_count if retry_count is not None and retry_count > 0 else "unlimited",
+        retry_delay_seconds=retry_delay,
+        duplicate_mode=duplicate_mode,
+        upload_log=upload_log,
+        log_remote_dir=log_remote_dir,
+    ))
     transfer_cls = SFTPUploader if mode == "upload" else SFTPDownloader
     transfer = transfer_cls(
         host=host,

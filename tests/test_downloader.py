@@ -181,11 +181,17 @@ class TestConnectWithRetry:
             d._connect_with_retry()
         d._connect.assert_called_once()
 
-    def test_retries_after_transient_error_then_succeeds(self, downloader_factory):
+    def test_retries_after_transient_error_then_succeeds(self, downloader_factory, caplog):
         d = downloader_factory(retry_count=5, wait_for_network=False)
         d._connect = MagicMock(side_effect=[OSError("refused"), OSError("refused"), None])
-        d._connect_with_retry()
+        with caplog.at_level(logging.WARNING):
+            d._connect_with_retry()
         assert d._connect.call_count == 3
+        messages = [r.message for r in caplog.records if "[CONNECTION_RETRY]" in r.message]
+        assert len(messages) == 2
+        assert 'attempt=1' in messages[0]
+        assert 'retry_limit=5' in messages[0]
+        assert "error=" in messages[0] and "OSError" in messages[0] and "refused" in messages[0]
 
     def test_retries_after_sftp_protocol_error(self, downloader_factory):
         d = downloader_factory(retry_count=2, wait_for_network=False)
@@ -467,7 +473,39 @@ class TestManifestPersistence:
         with caplog.at_level(logging.WARNING):
             result = d._load_manifest(tmp_path)
         assert result == {}
-        assert any("讀取失敗" in r.message for r in caplog.records)
+        message = next(r.message for r in caplog.records if "[MANIFEST_ERROR]" in r.message)
+        assert "讀取失敗" in message
+        assert 'reason="read_failed"' in message
+        assert f'path="{manifest_path}"' in message
+        assert 'action="ignore_manifest"' in message
+
+    def test_load_non_object_root_reports_schema_error(self, downloader_factory, tmp_path, caplog):
+        d = downloader_factory()
+        manifest_path = d._manifest_path(tmp_path)
+        manifest_path.write_text("[]", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            result = d._load_manifest(tmp_path)
+
+        assert result == {}
+        message = next(r.message for r in caplog.records if "[MANIFEST_ERROR]" in r.message)
+        assert 'reason="invalid_root_type"' in message
+        assert 'actual_type="list"' in message
+
+    def test_invalid_entry_only_disables_tracking_for_that_file(
+        self, downloader_factory, tmp_path, caplog
+    ):
+        d = downloader_factory()
+        d._manifest = {"bad.bin": "not-an-object", "good.bin": {"size": 1}}
+
+        with caplog.at_level(logging.WARNING):
+            assert d._manifest_entry("bad.bin", tmp_path) is None
+
+        assert d._manifest_entry("good.bin", tmp_path) == {"size": 1}
+        message = next(r.message for r in caplog.records if "[MANIFEST_ERROR]" in r.message)
+        assert 'reason="invalid_entry_type"' in message
+        assert 'file="bad.bin"' in message
+        assert 'action="ignore_entry"' in message
 
     def test_save_failure_is_caught_and_logged(self, downloader_factory, tmp_path, caplog):
         d = downloader_factory()
@@ -654,7 +692,9 @@ class TestDownloadOneFileLocalSmallerDuplicateMode:
 
 
 class TestDownloadOneFileLocalSmallerOverwriteMode:
-    def test_verified_same_version_resumes_via_append(self, downloader_factory, fake_sftp_factory, tmp_path):
+    def test_verified_same_version_resumes_via_append(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
         full_content = b"AAAAABBBBBCCCCCDDDDDEEEEE"
         # 沒下載完的內容留在暫存檔，目的地此時還不存在（見 downloader.PART_SUFFIX）
         (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(full_content[:10])
@@ -668,13 +708,20 @@ class TestDownloadOneFileLocalSmallerOverwriteMode:
             }
         }
         d.sftp = fake_sftp_factory(files={"/remote/f.bin": full_content}, mtimes={"/remote/f.bin": 1000})
-        result = d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+        with caplog.at_level(logging.INFO):
+            result = d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
         assert result == "downloaded"
         assert (tmp_path / "f.bin").read_bytes() == full_content
         assert not (tmp_path / "f_copy.bin").exists()
         assert not (tmp_path / ("f.bin" + dl.PART_SUFFIX)).exists(), "完成後暫存檔應已換名到目的地"
+        message = next(r.message for r in caplog.records if "[RESUME_ACCEPTED]" in r.message)
+        assert 'direction="download"' in message
+        assert "resume_offset=10" in message
+        assert f"remaining_bytes={len(full_content) - 10}" in message
 
-    def test_hash_mismatch_tampered_local_file_falls_back_to_full_redownload(self, downloader_factory, fake_sftp_factory, tmp_path):
+    def test_hash_mismatch_tampered_local_file_falls_back_to_full_redownload(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
         full_content = b"ORIGINAL-CONTENT-DATA"
         (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(b"TAMPERED12")  # 與紀錄檔中的雜湊對不上
         d = downloader_factory(duplicate_mode="overwrite")
@@ -687,9 +734,43 @@ class TestDownloadOneFileLocalSmallerOverwriteMode:
             }
         }
         d.sftp = fake_sftp_factory(files={"/remote/f.bin": full_content}, mtimes={"/remote/f.bin": 1000})
-        result = d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+        with caplog.at_level(logging.WARNING):
+            result = d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
         assert result == "downloaded"
         assert (tmp_path / "f.bin").read_bytes() == full_content
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="checkpoint_hash_mismatch"' in message
+        assert "partial_bytes=10" in message
+        assert "checkpoint_bytes=10" in message
+        assert 'action="restart"' in message
+
+    def test_checkpoint_offset_mismatch_reports_both_sizes(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        full_content = b"O" * 30
+        part_size = 10
+        checkpoint_bytes = 8
+        (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(full_content[:part_size])
+        d = downloader_factory(duplicate_mode="overwrite")
+        d._manifest = {
+            "f.bin": {
+                "size": len(full_content),
+                "mtime": 1000,
+                "local_sha256": hashlib.sha256(full_content[:checkpoint_bytes]).hexdigest(),
+                "local_bytes": checkpoint_bytes,
+            }
+        }
+        d.sftp = fake_sftp_factory(files={"/remote/f.bin": full_content}, mtimes={"/remote/f.bin": 1000})
+
+        with caplog.at_level(logging.WARNING):
+            result = d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        assert result == "downloaded"
+        assert (tmp_path / "f.bin").read_bytes() == full_content
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="checkpoint_offset_mismatch"' in message
+        assert f"partial_bytes={part_size}" in message
+        assert f"checkpoint_bytes={checkpoint_bytes}" in message
 
     def test_remote_version_changed_falls_back_to_full_redownload(self, downloader_factory, fake_sftp_factory, tmp_path):
         """就算本地雜湊本身沒問題，只要遠端版本（size/mtime）跟紀錄不符，就不能信任接續。"""
