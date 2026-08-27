@@ -393,6 +393,41 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 
 畫面／終端機顯示的仍是易讀文字，但本地儲存的 log 檔（`logs/` 資料夾內、副檔名 `.csv`）是 **CSV 格式**，欄位為 `timestamp, device_name, version_info, level, message`（`version_info` 為選填欄位，未填則該欄位為空），可直接用 Excel 開啟；若把上百台裝置的 log 檔集中到同一資料夾，可直接合併成一份總表，用「裝置名稱」或「版號」欄位篩選、用「時間」排序即可彙整查看所有裝置的下載狀況。
 
+診斷訊息會以穩定事件代碼開頭，細節採 JSON 相容的 `key=value`；CSV 五欄與既有的
+「任務開始／結束」錨點不變，所以新版 monitor 仍可混合讀取歷史 log。例如：
+
+```text
+[RESUME_REJECTED] 遠端部分檔案無法安全接續，覆蓋遠端檔案: media.tar direction="upload" reason="checkpoint_offset_mismatch" local_size=183500800 remote_size=67108864 checkpoint_bytes=62914560 action="overwrite"
+```
+
+常用事件代碼：
+
+| 事件代碼 | 意義 |
+|---|---|
+| `RUN_CONTEXT` | 已解析的執行設定；包含方向、路徑、重試與續傳開關，但不記錄密碼或私鑰內容 |
+| `CONNECTION_RETRY` / `CONNECTION_ERROR` | 連線錯誤、例外類型、次數、上限及下一步 |
+| `MANIFEST_ERROR` | manifest 讀寫或資料結構錯誤，以及採用的安全回退動作 |
+| `RESUME_ACCEPTED` | 續傳驗證通過；包含 offset、總大小與剩餘位元組數 |
+| `RESUME_REJECTED` | 續傳被拒絕；包含精確原因、雙方大小、checkpoint offset 與 hash 是否存在 |
+| `CHECKPOINT_SAVED` | 取消或傳輸錯誤後保存的進度、signal、offset 與 manifest 寫入結果 |
+| `LIST_RETRY` / `TRANSFER_RETRY` / `TRANSFER_ERROR` | 清單、單檔傳輸的階段、重試資訊、例外及最終動作 |
+
+`RESUME_REJECTED` 的常見 `reason`：
+
+| reason | 意義 |
+|---|---|
+| `checkpoint_missing` | 找不到該檔案的 checkpoint |
+| `checkpoint_offset_missing` | checkpoint 缺少已傳輸位元組數 |
+| `checkpoint_offset_mismatch` | 實際 `.part`／遠端大小與 checkpoint 位移不同，常見於行程被強制終止 |
+| `checkpoint_hash_missing` | checkpoint 沒有前綴 SHA-256 |
+| `checkpoint_hash_mismatch` | 目前本地前綴與 checkpoint SHA-256 不同 |
+| `source_size_changed` / `source_mtime_changed` | 下載來源在兩次執行之間換版 |
+| `local_size_changed` / `local_mtime_changed` | 上傳來源在兩次執行之間換版 |
+
+續傳被拒絕屬安全回退，因此記為 `WARNING`：下載會重新建立 `.part`，上傳則在
+`duplicate_mode=overwrite` 時從 byte 0 覆蓋。這不代表一定有人修改檔案，應以 `reason`
+與列出的大小／offset 判斷。
+
 ### 版本標記（`VERSION.json` → `VERSION.stamp.json`）
 
 `main.py` 的 `run_cli()` 會檢查待傳輸專案（`local_path`）的**根目錄有沒有 `VERSION.json`**：

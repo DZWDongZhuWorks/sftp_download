@@ -13,7 +13,16 @@ from pathlib import Path, PurePosixPath
 
 import paramiko
 
-from downloader import CHUNK_SIZE, MANIFEST_FILENAME, PART_SUFFIX, SFTPBase, format_size
+from downloader import (
+    CHUNK_SIZE,
+    MANIFEST_FILENAME,
+    PART_SUFFIX,
+    SFTPBase,
+    TransferCancelled,
+    diagnostic_message,
+    format_exception,
+    format_size,
+)
 
 UPLOAD_MANIFEST_FILENAME = ".sftp_upload_manifest.json"
 
@@ -174,17 +183,40 @@ class SFTPUploader(SFTPBase):
                     target_remote = self._next_remote_duplicate_path(remote_file)
                     self.logger.info(f"重新上傳，另存為: {PurePosixPath(target_remote).name}")
             else:
-                known = self._manifest.get(rel_path)
+                known = self._manifest_entry(rel_path, local_root)
 
                 if remote_disk_size == local_size:
                     # 大小相同：用版本紀錄（若有）判斷是否真的未變更；沒有紀錄則姑且視為未變更略過。
                     if known is None or (known.get("size") == local_size and known.get("mtime") == local_mtime):
-                        self.logger.info(f"略過（已完整上傳）: {rel_path}")
+                        self.logger.info(diagnostic_message(
+                            "FILE_DECISION",
+                            f"略過（已完整上傳）: {rel_path}",
+                            direction="upload",
+                            reason="same_size_without_manifest" if known is None else "manifest_version_match",
+                            file=rel_path,
+                            local_size=local_size,
+                            local_mtime=local_mtime,
+                            remote_size=remote_disk_size,
+                            verification="size_only" if known is None else "size_and_mtime",
+                            action="skip",
+                        ))
                         self._manifest[rel_path] = {"size": local_size, "mtime": local_mtime}
                         self._save_manifest(local_root)
                         return "skipped"
                     if self.duplicate_mode == "overwrite":
-                        self.logger.info(f"偵測到本地檔案已更新，覆蓋遠端檔案: {rel_path}")
+                        self.logger.info(diagnostic_message(
+                            "FILE_DECISION",
+                            f"偵測到本地檔案已更新，覆蓋遠端檔案: {rel_path}",
+                            direction="upload",
+                            reason="manifest_version_changed",
+                            file=rel_path,
+                            local_size=local_size,
+                            local_mtime=local_mtime,
+                            remote_size=remote_disk_size,
+                            checkpoint_size=known.get("size"),
+                            checkpoint_mtime=known.get("mtime"),
+                            action="overwrite",
+                        ))
                     else:
                         target_remote = self._next_remote_duplicate_path(remote_file)
                         self.logger.info(f"偵測到本地檔案已更新，另存為: {PurePosixPath(target_remote).name}")
@@ -199,30 +231,64 @@ class SFTPUploader(SFTPBase):
                     target_remote = self._next_remote_duplicate_path(remote_file)
                     self.logger.info(f"重新上傳，另存為: {PurePosixPath(target_remote).name}")
                 else:
-                    # 遠端檔案比本地小：檢查本地版本是否仍與紀錄一致，並用「本地端前綴雜湊」確認遠端這段
-                    # 已上傳的內容有沒有被外部更動過。與下載端對稱：只讀本機磁碟跟紀錄檔裡的雜湊比對，
-                    # 不會為了驗證而回讀遠端已上傳的內容。
-                    same_local_version = (
-                        known is not None
-                        and known.get("size") == local_size
-                        and known.get("mtime") == local_mtime
-                    )
-                    verified = False
-                    if same_local_version and known.get("local_bytes") == remote_disk_size and known.get("local_sha256"):
-                        prefix_hash = self._hash_local_prefix(local_file, remote_disk_size)
-                        if prefix_hash.hexdigest() == known["local_sha256"]:
-                            verified = True
-                            running_hash = prefix_hash  # 直接沿用，後續新上傳的內容繼續累加上去
-
-                    if verified:
-                        self.logger.info(f"遠端內容雜湊比對相符，接續上傳: {rel_path}")
-                        uploaded_bytes = remote_disk_size
-                        mode = "ab"
+                    # 遠端檔案比本地小：逐項驗證 checkpoint，並留下穩定 reason code。
+                    # 只讀本機前綴與 manifest，不回讀遠端內容；remote_size 的角色是確認
+                    # 遠端目前長度與最後一次已保存的 offset 精確一致。
+                    reject_reason = None
+                    actual_hash = None
+                    if known is None:
+                        reject_reason = "checkpoint_missing"
+                    elif known.get("size") != local_size:
+                        reject_reason = "local_size_changed"
+                    elif known.get("mtime") != local_mtime:
+                        reject_reason = "local_mtime_changed"
+                    elif "local_bytes" not in known:
+                        reject_reason = "checkpoint_offset_missing"
+                    elif known.get("local_bytes") != remote_disk_size:
+                        reject_reason = "checkpoint_offset_mismatch"
+                    elif not known.get("local_sha256"):
+                        reject_reason = "checkpoint_hash_missing"
                     else:
-                        # 走到這裡 duplicate_mode 必定是 "overwrite"："duplicate" 模式在上面的 elif
-                        # 分支就已經攔截、一律整份重新上傳成新檔案，不會執行到這裡。
-                        reason = "本地檔案內容與紀錄不符（可能已被人為修改）" if same_local_version else "偵測到本地檔案已更新"
-                        self.logger.info(f"{reason}，覆蓋遠端檔案: {rel_path}")
+                        prefix_hash = self._hash_local_prefix(local_file, remote_disk_size)
+                        actual_hash = prefix_hash.hexdigest()
+                        if actual_hash == known["local_sha256"]:
+                            running_hash = prefix_hash  # 直接沿用，後續新上傳的內容繼續累加上去
+                            self.logger.info(diagnostic_message(
+                                "RESUME_ACCEPTED",
+                                f"檢查點驗證相符，接續上傳: {rel_path}",
+                                direction="upload",
+                                file=rel_path,
+                                local_size=local_size,
+                                local_mtime=local_mtime,
+                                remote_size=remote_disk_size,
+                                resume_offset=remote_disk_size,
+                                remaining_bytes=local_size - remote_disk_size,
+                                action="append",
+                            ))
+                            uploaded_bytes = remote_disk_size
+                            mode = "ab"
+                        else:
+                            reject_reason = "checkpoint_hash_mismatch"
+
+                    if mode == "wb":
+                        # 走到這裡 duplicate_mode 必定是 overwrite；安全檢查未通過就從頭覆蓋。
+                        self.logger.warning(diagnostic_message(
+                            "RESUME_REJECTED",
+                            f"遠端部分檔案無法安全接續，覆蓋遠端檔案: {rel_path}",
+                            direction="upload",
+                            reason=reject_reason or "unknown",
+                            file=rel_path,
+                            local_size=local_size,
+                            local_mtime=local_mtime,
+                            remote_size=remote_disk_size,
+                            checkpoint_size=known.get("size") if known else None,
+                            checkpoint_mtime=known.get("mtime") if known else None,
+                            checkpoint_bytes=known.get("local_bytes") if known else None,
+                            checkpoint_hash_present=bool(known and known.get("local_sha256")),
+                            expected_hash_prefix=str(known.get("local_sha256") or "")[:12] if known else None,
+                            actual_hash_prefix=actual_hash[:12] if actual_hash else None,
+                            action="overwrite",
+                        ))
 
         self.logger.info(f"開始上傳: {rel_path} ({format_size(local_size)})")
         last_pct_logged = -1
@@ -232,6 +298,8 @@ class SFTPUploader(SFTPBase):
         # 記住上次印進度的時間與位元組數，用差值算「這段期間的即時速率」，比整體平均更能反映當下網速。
         last_log_time = start_time
         last_log_bytes = transferred
+        cancelled = None
+        transfer_error = None
         try:
             with open(local_file, "rb") as local_f:
                 local_f.seek(uploaded_bytes)
@@ -268,6 +336,12 @@ class SFTPUploader(SFTPBase):
                                 }
                                 self._save_manifest(local_root)
                                 last_checkpoint_pct = pct
+        except TransferCancelled as e:
+            cancelled = e
+            raise
+        except (paramiko.SSHException, OSError, EOFError) as e:
+            transfer_error = e
+            raise
         finally:
             # 不論成功、失敗或中途被中斷，都存下目前實際上傳到的位置與雜湊，讓下次重試時能正確判斷
             # 「這是同一版本尚未上傳完的部分」，而不是每次中斷後都只能整份重來。
@@ -278,7 +352,35 @@ class SFTPUploader(SFTPBase):
                     "local_sha256": running_hash.hexdigest(),
                     "local_bytes": transferred,
                 }
-                self._save_manifest(local_root)
+                saved = self._save_manifest(local_root)
+                if cancelled:
+                    self.logger.warning(diagnostic_message(
+                        "CHECKPOINT_SAVED",
+                        f"取消 checkpoint: {rel_path} offset={transferred}/{local_size}",
+                        direction="upload",
+                        reason="cancelled",
+                        signal=cancelled.signum,
+                        file=rel_path,
+                        offset=transferred,
+                        total_size=local_size,
+                        local_mtime=local_mtime,
+                        sha256_prefix=running_hash.hexdigest()[:12],
+                        manifest_saved=saved,
+                    ))
+                elif transfer_error:
+                    self.logger.warning(diagnostic_message(
+                        "CHECKPOINT_SAVED",
+                        f"上傳錯誤後已保存 checkpoint: {rel_path}",
+                        direction="upload",
+                        reason="transfer_error",
+                        file=rel_path,
+                        offset=transferred,
+                        total_size=local_size,
+                        local_mtime=local_mtime,
+                        sha256_prefix=running_hash.hexdigest()[:12],
+                        manifest_saved=saved,
+                        error=format_exception(transfer_error),
+                    ))
 
         total_elapsed = time.time() - start_time
         uploaded_this_run = transferred - uploaded_bytes  # 本次實際上傳的位元組（不含斷點續傳前遠端已存在的部分）
@@ -368,7 +470,18 @@ class SFTPUploader(SFTPBase):
                         except (paramiko.SSHException, OSError, EOFError) as e:
                             file_list = None
                             list_attempts += 1
-                            self.logger.warning(f"建立遠端目錄或列出本地檔案清單發生錯誤（第 {list_attempts} 次）: {e}")
+                            self.logger.warning(diagnostic_message(
+                                "LIST_RETRY",
+                                f"建立遠端目錄或列出本地檔案清單發生錯誤（第 {list_attempts} 次）: {format_exception(e)}",
+                                direction="upload",
+                                phase="prepare_remote_and_list_local",
+                                source=source,
+                                remote_root=remote_root,
+                                attempt=list_attempts,
+                                retry_limit=(self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"),
+                                error=format_exception(e),
+                                action="reconnect",
+                            ))
                             if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
                                 self.logger.error("已達重試上限，任務中止")
                                 return False
@@ -395,18 +508,58 @@ class SFTPUploader(SFTPBase):
                                     uploaded += 1
                                 break
                             except PermissionError as e:
-                                self.logger.error(f"上傳失敗（權限不足）: {rel_path}: {e}")
+                                self.logger.error(diagnostic_message(
+                                    "TRANSFER_ERROR",
+                                    f"上傳失敗（權限不足）: {rel_path}: {e}",
+                                    direction="upload",
+                                    reason="permission_denied",
+                                    file=rel_path,
+                                    local_file=local_file,
+                                    remote_root=remote_root,
+                                    error=format_exception(e),
+                                    action="fail_file",
+                                ))
                                 failed.append(rel_path)
                                 break
                             except FileNotFoundError as e:
-                                self.logger.error(f"本地檔案不存在: {rel_path}: {e}")
+                                self.logger.error(diagnostic_message(
+                                    "TRANSFER_ERROR",
+                                    f"本地檔案不存在: {rel_path}: {e}",
+                                    direction="upload",
+                                    reason="local_file_missing",
+                                    file=rel_path,
+                                    local_file=local_file,
+                                    error=format_exception(e),
+                                    action="fail_file",
+                                ))
                                 failed.append(rel_path)
                                 break
                             except (paramiko.SSHException, OSError, EOFError) as e:
                                 attempts += 1
-                                self.logger.warning(f"上傳 {rel_path} 發生錯誤（第 {attempts} 次）: {e}")
+                                self.logger.warning(diagnostic_message(
+                                    "TRANSFER_RETRY",
+                                    f"上傳 {rel_path} 發生錯誤（第 {attempts} 次）: {format_exception(e)}",
+                                    direction="upload",
+                                    file=rel_path,
+                                    local_file=local_file,
+                                    remote_root=remote_root,
+                                    attempt=attempts,
+                                    retry_limit=(self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"),
+                                    error=format_exception(e),
+                                    action="reconnect",
+                                ))
                                 if not self.auto_reconnect or self._retry_limit_reached(attempts):
-                                    self.logger.error(f"檔案 {rel_path} 上傳失敗，放棄重試")
+                                    reason = "auto_reconnect_disabled" if not self.auto_reconnect else "retry_limit_reached"
+                                    self.logger.error(diagnostic_message(
+                                        "TRANSFER_ERROR",
+                                        f"檔案 {rel_path} 上傳失敗，放棄重試",
+                                        direction="upload",
+                                        reason=reason,
+                                        file=rel_path,
+                                        attempts=attempts,
+                                        error=format_exception(e),
+                                        action="fail_file",
+                                    ))
                                     failed.append(rel_path)
                                     break
                                 try:
@@ -418,7 +571,14 @@ class SFTPUploader(SFTPBase):
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
             return False
         except Exception as e:
-            self.logger.error(f"=== 任務中止：{e} ===")
+            detail = format_exception(e)
+            self.logger.error(diagnostic_message(
+                "RUN_ABORTED",
+                "任務發生未處理錯誤",
+                direction="upload",
+                error=detail,
+                action="abort",
+            ) + f" === 任務中止：{detail} ===")
             return False
         finally:
             self._close()

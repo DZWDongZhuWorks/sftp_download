@@ -102,6 +102,39 @@ class TestRunCliSettingsOnly:
         main_module.run_cli(args)
         assert captured["kwargs"]["host"] == "192.168.9.9"
 
+    def test_run_context_logs_resolved_settings_without_password(self, tmp_path, monkeypatch):
+        settings_path = self._write_settings(
+            tmp_path,
+            password="do-not-log-this",
+            resume=True,
+            retry_count=4,
+            duplicate_mode="overwrite",
+        )
+        logger = MagicMock()
+
+        class FakeDownloader:
+            def __init__(self, **kwargs):
+                pass
+
+            def run(self):
+                return True
+
+        monkeypatch.setattr(main_module, "SFTPDownloader", FakeDownloader)
+        monkeypatch.setattr(main_module, "create_logger", lambda *a, **k: (logger, "fake.csv"))
+
+        assert main_module.run_cli(make_args(config=str(settings_path))) == 0
+
+        # Mock.Call.args 是 Python 3.8 才加入；船端 Bionic 仍是 3.6，用傳統索引。
+        message = logger.info.call_args_list[0][0][0]
+        assert message.startswith("[RUN_CONTEXT]")
+        assert 'mode="download"' in message
+        assert f'config_path="{settings_path}"' in message
+        assert 'resume=true' in message
+        assert 'retry_count=4' in message
+        assert "do-not-log-this" not in message
+        assert "password=" not in message
+        assert 'auth="password"' in message
+
     def test_ignore_file_resolved_from_settings(self, tmp_path, monkeypatch):
         captured = self._fake_downloader_and_logger(monkeypatch)
         settings_path = self._write_settings(tmp_path, ignore_file="ignore_rules.txt")

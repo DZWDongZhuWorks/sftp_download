@@ -68,6 +68,25 @@ def format_exception(error):
     return f"{type(error).__name__}: {error!r}"
 
 
+def diagnostic_message(event, summary, **fields):
+    """建立可供人閱讀、也可被程式穩定解析的診斷訊息。
+
+    CSV 欄位維持既有五欄不變；事件代碼與欄位都放在 message 中，避免破壞已部署的
+    log_monitor 與歷史 log。欄位值使用 JSON 表示法，因此空白、逗號與中文路徑不會
+    產生歧義。呼叫端不得放入 password、私鑰內容等秘密。
+    """
+    parts = [f"[{event}]", summary]
+    for key, value in fields.items():
+        if isinstance(value, Path):
+            value = str(value)
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            encoded = json.dumps(str(value), ensure_ascii=False)
+        parts.append(f"{key}={encoded}")
+    return " ".join(parts)
+
+
 class _CSVFileHandler(logging.Handler):
     """把 Log 寫成 CSV，方便日後把上百台裝置的 Log 彙整成同一份表格用 Excel 檢視。"""
 
@@ -205,7 +224,14 @@ class SFTPBase:
         return attempts > self.retry_count
 
     def _connect(self):
-        self.logger.info(f"正在連線至 {self.host}:{self.port} ...")
+        self.logger.info(diagnostic_message(
+            "CONNECTION_ATTEMPT",
+            f"正在連線至 {self.host}:{self.port} ...",
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            auth="key" if self.key_file else "password",
+        ))
         # 每次建立新連線前先清掉舊的 SFTP channel / SSH transport，避免斷線
         # 重連時殘留半開連線，累積占用本機與伺服器端資源。
         self._close()
@@ -234,7 +260,9 @@ class SFTPBase:
             raise
         self.client = client
         self.sftp = sftp
-        self.logger.info("連線成功")
+        self.logger.info(diagnostic_message(
+            "CONNECTION_OK", "連線成功", host=self.host, port=self.port,
+        ))
 
     def _connect_with_retry(self):
         attempts = 0
@@ -243,13 +271,42 @@ class SFTPBase:
                 self._connect()
                 return
             except paramiko.AuthenticationException:
-                self.logger.error("連線失敗：帳號或密碼錯誤")
+                self.logger.error(diagnostic_message(
+                    "CONNECTION_ERROR",
+                    "連線失敗：帳號或密碼錯誤",
+                    reason="authentication_failed",
+                    host=self.host,
+                    port=self.port,
+                    username=self.username,
+                    action="abort",
+                ))
                 raise
             except SFTP_RETRY_EXCEPTIONS as e:
                 attempts += 1
-                self.logger.warning(f"連線失敗（第 {attempts} 次）：{format_exception(e)}")
+                limit = self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"
+                self.logger.warning(diagnostic_message(
+                    "CONNECTION_RETRY",
+                    f"連線失敗（第 {attempts} 次）：{format_exception(e)}",
+                    reason="connection_error",
+                    host=self.host,
+                    port=self.port,
+                    attempt=attempts,
+                    retry_limit=limit,
+                    retry_delay_seconds=self.retry_delay,
+                    error=format_exception(e),
+                ))
                 if not self.auto_reconnect or self._retry_limit_reached(attempts):
-                    self.logger.error("已達重試上限，放棄連線")
+                    reason = "auto_reconnect_disabled" if not self.auto_reconnect else "retry_limit_reached"
+                    self.logger.error(diagnostic_message(
+                        "CONNECTION_ERROR",
+                        "已達重試上限，放棄連線",
+                        reason=reason,
+                        host=self.host,
+                        port=self.port,
+                        attempts=attempts,
+                        retry_limit=limit,
+                        action="abort",
+                    ))
                     raise
                 if self.wait_for_network:
                     self._wait_for_network()
@@ -263,7 +320,15 @@ class SFTPBase:
                     self.logger.info("網路連線已恢復")
                     return
             except OSError:
-                self.logger.warning(f"無法連線至 {self.host}:{self.port}，{self.retry_delay} 秒後重試...")
+                self.logger.warning(diagnostic_message(
+                    "NETWORK_WAIT",
+                    f"無法連線至 {self.host}:{self.port}，{self.retry_delay} 秒後重試...",
+                    reason="tcp_unreachable",
+                    host=self.host,
+                    port=self.port,
+                    retry_delay_seconds=self.retry_delay,
+                    action="retry",
+                ))
                 time.sleep(self.retry_delay)
 
     def _close(self):
@@ -289,14 +354,25 @@ class SFTPBase:
             return None
         path = Path(self.ignore_file)
         if not path.exists():
-            self.logger.info(f"忽略設定檔不存在，不忽略任何檔案: {path}")
+            self.logger.info(diagnostic_message(
+                "IGNORE_FILE_MISSING",
+                f"忽略設定檔不存在，不忽略任何檔案: {path}",
+                path=path,
+                action="ignore_no_files",
+            ))
             return None
         try:
             # utf-8-sig：Windows 記事本以 UTF-8 存檔時常會加上 BOM，若不去除，
             # BOM 會黏在第一行規則前面，導致第一條規則永遠比對不到。
             lines = path.read_text(encoding="utf-8-sig").splitlines()
         except (OSError, UnicodeDecodeError) as e:
-            self.logger.warning(f"忽略設定檔讀取失敗，不忽略任何檔案: {e}")
+            self.logger.warning(diagnostic_message(
+                "IGNORE_FILE_ERROR",
+                f"忽略設定檔讀取失敗，不忽略任何檔案: {e}",
+                path=path,
+                error=format_exception(e),
+                action="ignore_no_files",
+            ))
             return None
         valid_lines = []
         for lineno, line in enumerate(lines, 1):
@@ -304,7 +380,14 @@ class SFTPBase:
                 GitIgnoreSpec.from_lines([line])
                 valid_lines.append(line)
             except ValueError:
-                self.logger.warning(f"忽略設定檔第 {lineno} 行格式錯誤，已略過此規則: {line!r}")
+                self.logger.warning(diagnostic_message(
+                    "IGNORE_RULE_ERROR",
+                    f"忽略設定檔第 {lineno} 行格式錯誤，已略過此規則: {line!r}",
+                    path=path,
+                    line_number=lineno,
+                    rule=line,
+                    action="skip_rule",
+                ))
         self.logger.info(f"已載入忽略設定檔: {path}")
         return GitIgnoreSpec.from_lines(valid_lines)
 
@@ -321,17 +404,61 @@ class SFTPBase:
             return {}
         try:
             with open(path, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            self.logger.warning(f"版本紀錄檔讀取失敗，將視為未追蹤過任何檔案: {e}")
+            self.logger.warning(diagnostic_message(
+                "MANIFEST_ERROR",
+                f"版本紀錄檔讀取失敗，將視為未追蹤過任何檔案: {e}",
+                reason="read_failed",
+                path=path,
+                error=format_exception(e),
+                action="ignore_manifest",
+            ))
             return {}
+        if not isinstance(data, dict):
+            self.logger.warning(diagnostic_message(
+                "MANIFEST_ERROR",
+                "版本紀錄檔根節點不是 JSON 物件，將視為未追蹤過任何檔案",
+                reason="invalid_root_type",
+                path=path,
+                actual_type=type(data).__name__,
+                action="ignore_manifest",
+            ))
+            return {}
+        return data
+
+    def _manifest_entry(self, rel_path, local_root):
+        """讀取單一 manifest entry；格式壞掉時只忽略該檔案，不拖垮整批傳輸。"""
+        known = self._manifest.get(rel_path)
+        if known is None or isinstance(known, dict):
+            return known
+        self.logger.warning(diagnostic_message(
+            "MANIFEST_ERROR",
+            f"版本紀錄項目格式錯誤，將視為未追蹤過此檔案: {rel_path}",
+            reason="invalid_entry_type",
+            path=self._manifest_path(local_root),
+            file=rel_path,
+            actual_type=type(known).__name__,
+            action="ignore_entry",
+        ))
+        return None
 
     def _save_manifest(self, local_root):
+        path = self._manifest_path(local_root)
         try:
-            with open(self._manifest_path(local_root), "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._manifest, f, ensure_ascii=False, indent=2)
+            return True
         except OSError as e:
-            self.logger.warning(f"版本紀錄檔寫入失敗: {e}")
+            self.logger.warning(diagnostic_message(
+                "MANIFEST_ERROR",
+                f"版本紀錄檔寫入失敗: {e}",
+                reason="write_failed",
+                path=path,
+                error=format_exception(e),
+                action="continue_without_persisted_checkpoint",
+            ))
+            return False
 
     def _hash_local_file(self, local_file):
         """計算本地端檔案目前內容的 SHA-256（只讀本機磁碟，不牽涉網路），
@@ -361,16 +488,33 @@ class SFTPBase:
 
     def _upload_log_file(self):
         try:
-            self.logger.info("正在上傳 Log 檔至 SFTP...")
+            self.logger.info(diagnostic_message(
+                "LOG_UPLOAD_ATTEMPT",
+                "正在上傳 Log 檔至 SFTP...",
+                local_file=self.log_file,
+                remote_dir=self.remote_log_dir,
+            ))
             for handler in self.logger.handlers:
                 handler.flush()
             self._connect_with_retry()
             self._ensure_remote_dir(self.remote_log_dir)
             remote_name = self.remote_log_dir.rstrip("/") + "/" + Path(self.log_file).name
             self.sftp.put(str(self.log_file), remote_name)
-            self.logger.info(f"Log 上傳完成: {remote_name}")
+            self.logger.info(diagnostic_message(
+                "LOG_UPLOAD_OK",
+                f"Log 上傳完成: {remote_name}",
+                local_file=self.log_file,
+                remote_file=remote_name,
+            ))
         except Exception as e:
-            self.logger.error(f"Log 上傳失敗: {format_exception(e)}")
+            self.logger.error(diagnostic_message(
+                "LOG_UPLOAD_ERROR",
+                f"Log 上傳失敗: {format_exception(e)}",
+                local_file=self.log_file,
+                remote_dir=self.remote_log_dir,
+                error=format_exception(e),
+                action="keep_local_log",
+            ))
         finally:
             self._close()
 
@@ -384,9 +528,14 @@ class SFTPBase:
         cancelled = False
         try:
             return self._run()
-        except TransferCancelled:
+        except TransferCancelled as exc:
             cancelled = True
-            self.logger.warning("=== 收到終止要求：已保存本地續傳進度，停止本次傳輸 ===")
+            self.logger.warning(diagnostic_message(
+                "TRANSFER_CANCELLED",
+                "=== 收到終止要求：已保存本地續傳進度，停止本次傳輸 ===",
+                signal=exc.signum,
+                action="stop_without_log_upload",
+            ))
             # CSV handler 每行本來就 flush；這裡再做一次，明確保證 SIGTERM 返回前本地
             # 記錄已落盤。遠端 log upload 需要重新連線，取消時不能再掉入無限重試。
             for handler in self.logger.handlers:
@@ -468,7 +617,7 @@ class SFTPDownloader(SFTPBase):
         local_size = 0
         mode = "wb"
         running_hash = hashlib.sha256()  # 邊下載邊累加，最後（或中斷當下）存進版本紀錄檔
-        known = self._manifest.get(rel_path)
+        known = self._manifest_entry(rel_path, local_root)
 
         if local_file.exists():
             if not self.resume:
@@ -519,28 +668,64 @@ class SFTPDownloader(SFTPBase):
         if self.resume and target_file == local_file and part_file.exists():
             part_size = part_file.stat().st_size
             # 遠端版本要與紀錄一致，且紀錄的長度/雜湊要對得上暫存檔的現況，才敢接著往下寫。
-            # 用「本地端雜湊」確認這段尚未下載完的內容有沒有被外部更動過（例如被人手動修改）。
-            # 這裡刻意只讀本機磁碟跟紀錄檔裡存的雜湊比對，不會為了驗證而重新從遠端讀取已下載
-            # 的內容，避免已下載比例越高、驗證反而越花時間、越像卡住的問題。
-            resumable = (
-                known is not None
-                and known.get("size") == remote_size
-                and known.get("mtime") == remote_mtime
-                and known.get("local_bytes") == part_size
-                and known.get("local_sha256")
-                and part_size < remote_size
-            )
-            if resumable:
+            # 每項條件分開判斷並留下穩定 reason code；舊訊息把所有原因混成「無法接續」，
+            # 無法分辨是來源換版、checkpoint 落後、manifest 壞掉或真的內容被修改。
+            reject_reason = None
+            actual_hash = None
+            if known is None:
+                reject_reason = "checkpoint_missing"
+            elif known.get("size") != remote_size:
+                reject_reason = "source_size_changed"
+            elif known.get("mtime") != remote_mtime:
+                reject_reason = "source_mtime_changed"
+            elif "local_bytes" not in known:
+                reject_reason = "checkpoint_offset_missing"
+            elif known.get("local_bytes") != part_size:
+                reject_reason = "checkpoint_offset_mismatch"
+            elif not known.get("local_sha256"):
+                reject_reason = "checkpoint_hash_missing"
+            elif part_size >= remote_size:
+                reject_reason = "partial_not_smaller_than_source"
+            else:
                 disk_hash = self._hash_local_file(part_file)
-                if disk_hash.hexdigest() == known["local_sha256"]:
-                    self.logger.info(f"本地端內容雜湊比對相符，接續下載: {rel_path}")
+                actual_hash = disk_hash.hexdigest()
+                if actual_hash == known["local_sha256"]:
+                    self.logger.info(diagnostic_message(
+                        "RESUME_ACCEPTED",
+                        f"本地端內容雜湊比對相符，接續下載: {rel_path}",
+                        direction="download",
+                        file=rel_path,
+                        source_size=remote_size,
+                        source_mtime=remote_mtime,
+                        resume_offset=part_size,
+                        remaining_bytes=remote_size - part_size,
+                        action="append",
+                    ))
                     local_size = part_size
                     running_hash = disk_hash  # 直接沿用，後續新下載的內容繼續累加上去
                     mode = "ab"
+                else:
+                    reject_reason = "checkpoint_hash_mismatch"
             if mode == "wb":
                 # 暫存檔對不上紀錄（來源已換版、內容被動過或根本沒有檢查點）→ 不可信，
                 # 整份重新下載；"wb" 開檔即截斷，不必另外刪除。
-                self.logger.info(f"既有暫存檔無法接續，整份重新下載: {rel_path}")
+                self.logger.warning(diagnostic_message(
+                    "RESUME_REJECTED",
+                    f"既有暫存檔無法接續，整份重新下載: {rel_path}",
+                    direction="download",
+                    reason=reject_reason or "unknown",
+                    file=rel_path,
+                    source_size=remote_size,
+                    source_mtime=remote_mtime,
+                    partial_bytes=part_size,
+                    checkpoint_size=known.get("size") if known else None,
+                    checkpoint_mtime=known.get("mtime") if known else None,
+                    checkpoint_bytes=known.get("local_bytes") if known else None,
+                    checkpoint_hash_present=bool(known and known.get("local_sha256")),
+                    expected_hash_prefix=str(known.get("local_sha256") or "")[:12] if known else None,
+                    actual_hash_prefix=actual_hash[:12] if actual_hash else None,
+                    action="restart",
+                ))
 
         self.logger.info(f"開始下載: {rel_path} ({format_size(remote_size)})")
         last_pct_logged = -1
@@ -550,7 +735,8 @@ class SFTPDownloader(SFTPBase):
         # 記住上次印進度的時間與位元組數，用差值算「這段期間的即時速率」，比整體平均更能反映當下網速。
         last_log_time = start_time
         last_log_bytes = transferred
-        cancelled = False
+        cancelled = None
+        transfer_error = None
         try:
             with self.sftp.open(remote_file, "rb") as remote_f:
                 remote_f.seek(local_size)
@@ -588,8 +774,8 @@ class SFTPDownloader(SFTPBase):
                                 }
                                 self._save_manifest(local_root)
                                 last_checkpoint_pct = pct
-        except TransferCancelled:
-            cancelled = True
+        except TransferCancelled as e:
+            cancelled = e
             # Python signal 可能恰好落在 local_f.write() 已完成、running_hash / transferred
             # 尚未更新的兩個 bytecode 之間。此時只相信記憶體 counter 會少記一個 chunk。
             # with 已先關閉並 flush 本地檔案，所以取消時從磁碟重算一次，讓 manifest 與
@@ -597,6 +783,9 @@ class SFTPDownloader(SFTPBase):
             if self.resume and part_file.exists():
                 transferred = part_file.stat().st_size
                 running_hash = self._hash_local_file(part_file)
+            raise
+        except (paramiko.SSHException, OSError, EOFError) as e:
+            transfer_error = e
             raise
         finally:
             # 不論成功、失敗或中途被中斷，都存下目前實際寫到的位置與雜湊，讓下次重試時
@@ -608,12 +797,37 @@ class SFTPDownloader(SFTPBase):
                     "local_sha256": running_hash.hexdigest(),
                     "local_bytes": transferred,
                 }
-                self._save_manifest(local_root)
+                saved = self._save_manifest(local_root)
                 if cancelled:
                     self.logger.warning(
-                        f"取消 checkpoint: {rel_path} offset={transferred}/{remote_size}, "
-                        f"mtime={remote_mtime}, sha256={running_hash.hexdigest()}"
+                        diagnostic_message(
+                            "CHECKPOINT_SAVED",
+                            f"取消 checkpoint: {rel_path} offset={transferred}/{remote_size}",
+                            direction="download",
+                            reason="cancelled",
+                            signal=cancelled.signum,
+                            file=rel_path,
+                            offset=transferred,
+                            total_size=remote_size,
+                            source_mtime=remote_mtime,
+                            sha256_prefix=running_hash.hexdigest()[:12],
+                            manifest_saved=saved,
+                        )
                     )
+                elif transfer_error:
+                    self.logger.warning(diagnostic_message(
+                        "CHECKPOINT_SAVED",
+                        f"下載錯誤後已保存 checkpoint: {rel_path}",
+                        direction="download",
+                        reason="transfer_error",
+                        file=rel_path,
+                        offset=transferred,
+                        total_size=remote_size,
+                        source_mtime=remote_mtime,
+                        sha256_prefix=running_hash.hexdigest()[:12],
+                        manifest_saved=saved,
+                        error=format_exception(transfer_error),
+                    ))
 
         total_elapsed = time.time() - start_time
         downloaded_bytes = transferred - local_size  # 本次實際下載的位元組（不含斷點續傳前已存在的部分）
@@ -696,13 +910,28 @@ class SFTPDownloader(SFTPBase):
                                 # 單一來源路徑不存在（常見於各船專屬路徑並非每船都有）時，只記警告並略過此來源，
                                 # 其餘存在的來源照常下載。FileNotFoundError 為 OSError 子類，需在此個別攔截，
                                 # 才不會被外層的網路錯誤分支當成連線問題而觸發重連。
-                                self.logger.warning(f"遠端路徑不存在，略過此來源: {current_root}")
+                                self.logger.warning(diagnostic_message(
+                                    "SOURCE_SKIPPED",
+                                    f"遠端路徑不存在，略過此來源: {current_root}",
+                                    direction="download",
+                                    reason="remote_path_missing",
+                                    source=current_root,
+                                    action="skip_source",
+                                ))
                     except SFTP_RETRY_EXCEPTIONS as e:
                         file_list = None
                         list_attempts += 1
-                        self.logger.warning(
-                            f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {format_exception(e)}"
-                        )
+                        self.logger.warning(diagnostic_message(
+                            "LIST_RETRY",
+                            f"列出遠端檔案清單發生錯誤（第 {list_attempts} 次）: {format_exception(e)}",
+                            direction="download",
+                            phase="list_remote",
+                            source=current_root,
+                            attempt=list_attempts,
+                            retry_limit=(self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"),
+                            error=format_exception(e),
+                            action="reconnect",
+                        ))
                         if not self.auto_reconnect or self._retry_limit_reached(list_attempts):
                             self.logger.error("已達重試上限，任務中止")
                             return False
@@ -735,20 +964,56 @@ class SFTPDownloader(SFTPBase):
                                 downloaded += 1
                             break
                         except PermissionError as e:
-                            self.logger.error(f"寫入失敗（權限不足）: {rel_path}: {e}")
+                            self.logger.error(diagnostic_message(
+                                "TRANSFER_ERROR",
+                                f"寫入失敗（權限不足）: {rel_path}: {e}",
+                                direction="download",
+                                reason="permission_denied",
+                                phase="write_local",
+                                file=rel_path,
+                                error=format_exception(e),
+                                action="fail_file",
+                            ))
                             failed.append(rel_path)
                             break
                         except FileNotFoundError as e:
-                            self.logger.error(f"檔案不存在: {rel_path}: {e}")
+                            self.logger.error(diagnostic_message(
+                                "TRANSFER_ERROR",
+                                f"檔案不存在: {rel_path}: {e}",
+                                direction="download",
+                                reason="file_missing",
+                                file=rel_path,
+                                remote_file=remote_file,
+                                error=format_exception(e),
+                                action="fail_file",
+                            ))
                             failed.append(rel_path)
                             break
                         except SFTP_RETRY_EXCEPTIONS as e:
                             attempts += 1
-                            self.logger.warning(
-                                f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {format_exception(e)}"
-                            )
+                            self.logger.warning(diagnostic_message(
+                                "TRANSFER_RETRY",
+                                f"下載 {rel_path} 發生錯誤（第 {attempts} 次）: {format_exception(e)}",
+                                direction="download",
+                                file=rel_path,
+                                remote_file=remote_file,
+                                attempt=attempts,
+                                retry_limit=(self.retry_count if self.retry_count is not None and self.retry_count > 0 else "unlimited"),
+                                error=format_exception(e),
+                                action="reconnect",
+                            ))
                             if not self.auto_reconnect or self._retry_limit_reached(attempts):
-                                self.logger.error(f"檔案 {rel_path} 下載失敗，放棄重試")
+                                reason = "auto_reconnect_disabled" if not self.auto_reconnect else "retry_limit_reached"
+                                self.logger.error(diagnostic_message(
+                                    "TRANSFER_ERROR",
+                                    f"檔案 {rel_path} 下載失敗，放棄重試",
+                                    direction="download",
+                                    reason=reason,
+                                    file=rel_path,
+                                    attempts=attempts,
+                                    error=format_exception(e),
+                                    action="fail_file",
+                                ))
                                 failed.append(rel_path)
                                 break
                             try:
@@ -760,7 +1025,14 @@ class SFTPDownloader(SFTPBase):
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
             return False
         except Exception as e:
-            self.logger.error(f"=== 任務中止：{format_exception(e)} ===")
+            detail = format_exception(e)
+            self.logger.error(diagnostic_message(
+                "RUN_ABORTED",
+                "任務發生未處理錯誤",
+                direction="download",
+                error=detail,
+                action="abort",
+            ) + f" === 任務中止：{detail} ===")
             return False
         finally:
             self._close()
