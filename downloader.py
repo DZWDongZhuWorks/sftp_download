@@ -216,6 +216,8 @@ class SFTPBase:
         self.client = None
         self.sftp = None
         self._manifest = {}
+        # 記憶體中的 manifest 是否已有尚未落盤的異動（見 _flush_manifest）。
+        self._manifest_dirty = False
         self._ignore_spec = None
 
     def _retry_limit_reached(self, attempts):
@@ -444,10 +446,13 @@ class SFTPBase:
         return None
 
     def _save_manifest(self, local_root):
+        """立刻把整份 manifest 落盤。呼叫點限於「真的需要 checkpoint 的當下」——
+        傳輸中每跨 10% 進度、以及單檔傳輸結束/中斷的收尾，見 _flush_manifest。"""
         path = self._manifest_path(local_root)
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._manifest, f, ensure_ascii=False, indent=2)
+            self._manifest_dirty = False
             return True
         except OSError as e:
             self.logger.warning(diagnostic_message(
@@ -459,6 +464,22 @@ class SFTPBase:
                 action="continue_without_persisted_checkpoint",
             ))
             return False
+
+    def _flush_manifest(self, local_root):
+        """把累積在記憶體中的 manifest 異動一次寫回磁碟（沒有異動就什麼都不做）。
+
+        「略過」的項目改走這條路而不是逐檔立刻落盤。原因是成本：manifest 是整份重寫的
+        JSON，岸端 monitor 同步 fleet_logs 時一次要略過近 4,000 個檔，實測單次重寫 32 ms、
+        整趟就是 120 秒與 1.9 GB 的寫入量 —— 而略過項目的內容全部可以從遠端 size/mtime
+        重新推導，逐檔落盤買不到任何東西。
+
+        真正需要 checkpoint 的地方**沒有**改成延後：傳輸中每跨 10% 進度、以及單檔結束或
+        中斷時的收尾，仍然是當下立刻 _save_manifest()。那些才是硬中止後決定「能不能接續」
+        的依據，不能等。掉了略過項目最多是下次重新用大小比對推導一次，不影響正確性。
+        """
+        if not self.resume or not self._manifest_dirty:
+            return
+        self._save_manifest(local_root)
 
     def _hash_local_file(self, local_file):
         """計算本地端檔案目前內容的 SHA-256（只讀本機磁碟，不牽涉網路），
@@ -700,7 +721,7 @@ class SFTPDownloader(SFTPBase):
                     if known is None or (known.get("size") == remote_size and known.get("mtime") == remote_mtime):
                         self.logger.info(f"略過（已完整下載）: {rel_path}")
                         self._manifest[rel_path] = {"size": remote_size, "mtime": remote_mtime}
-                        self._save_manifest(local_root)
+                        self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
                         return "skipped"
                     if self.duplicate_mode == "overwrite":
                         self.logger.info(f"偵測到來源檔案已更新，覆蓋舊檔案: {rel_path}")
@@ -950,6 +971,7 @@ class SFTPDownloader(SFTPBase):
         multi_job = len(jobs) > 1  # 配對或依 basename 展開時皆為多組獨立工作
 
         downloaded, skipped, failed = 0, 0, []
+        current_local_root = None  # 中止時要把哪一組工作的 manifest 寫回（見收尾的 finally）
         try:
             if self.wait_for_network:
                 self._wait_for_network()
@@ -961,6 +983,8 @@ class SFTPDownloader(SFTPBase):
                 local_root.mkdir(parents=True, exist_ok=True)
                 # 配對模式各目的地各自維護版本紀錄檔；合併模式共用單一 local 的紀錄檔。
                 self._manifest = self._load_manifest(local_root) if self.resume else {}
+                self._manifest_dirty = False
+                current_local_root = local_root
 
                 file_list = None
                 list_attempts = 0
@@ -1093,6 +1117,9 @@ class SFTPDownloader(SFTPBase):
                             except Exception:
                                 failed.append(rel_path)
                                 break
+
+                # 這組工作跑完：把累積的「略過」項目一次寫回。
+                self._flush_manifest(local_root)
         except paramiko.AuthenticationException:
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
             return False
@@ -1106,6 +1133,11 @@ class SFTPDownloader(SFTPBase):
                 action="abort",
             ) + f" === 任務中止：{detail} ===")
             return False
+        finally:
+            # 中止（含 SIGTERM 取消）時，尚未落盤的略過項目也寫回，避免下一趟白跑一次比對。
+            # 正常路徑上面已經寫過，這裡因 _manifest_dirty 為 False 而不會重複寫。
+            if current_local_root is not None:
+                self._flush_manifest(current_local_root)
 
         if multi_job:
             self.logger.info(

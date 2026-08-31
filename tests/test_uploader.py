@@ -476,6 +476,30 @@ class TestRun:
         d, fake = self._prepare(uploader_factory, fake_sftp_factory, local_path=str(tmp_path / "nope"))
         assert d.run() is False
 
+    def test_all_skipped_run_writes_the_manifest_once_not_once_per_file(
+        self, uploader_factory, fake_sftp_factory, tmp_path
+    ):
+        for i in range(12):
+            _write(tmp_path / ("f%02d.bin" % i), bytes([i]) * (i + 1))
+        fake = fake_sftp_factory(files={})
+        d = uploader_factory(wait_for_network=False)
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        d._close = MagicMock()
+        assert d.run() is True  # 第一次：全新上傳
+
+        d._save_manifest = MagicMock(side_effect=d._save_manifest)
+        assert d.run() is True  # 第二次：12 個檔全部略過
+        assert d._save_manifest.call_count == 1
+        assert set(d._load_manifest(tmp_path)) == {"f%02d.bin" % i for i in range(12)}
+
+    def test_skip_marks_dirty_without_touching_disk(self, uploader_factory, fake_sftp_factory, tmp_path):
+        _write(tmp_path / "a.txt", b"aaa")
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"aaa"})
+        assert d._upload_one_file(tmp_path / "a.txt", "a.txt", "/remote", tmp_path) == "skipped"
+        assert d._manifest_dirty is True
+        assert not d._manifest_path(tmp_path).exists()
+
     def test_log_upload_reuses_the_transfer_connection(self, uploader_factory, fake_sftp_factory, tmp_path):
         # 與下載端同一個機制：_run() 不關連線，留給 run() 收尾，log 上傳因此少一次握手。
         _write(tmp_path / "a.txt", b"aaa")
