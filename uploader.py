@@ -201,7 +201,7 @@ class SFTPUploader(SFTPBase):
                             action="skip",
                         ))
                         self._manifest[rel_path] = {"size": local_size, "mtime": local_mtime}
-                        self._save_manifest(local_root)
+                        self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
                         return "skipped"
                     if self.duplicate_mode == "overwrite":
                         self.logger.info(diagnostic_message(
@@ -446,6 +446,7 @@ class SFTPUploader(SFTPBase):
         multi_job = len(jobs) > 1  # 配對或依 basename 展開時皆為多組獨立工作
 
         uploaded, skipped, failed = 0, 0, []
+        current_local_root = None  # 中止時要把哪一份 manifest 寫回（見收尾的 finally）
         try:
             if self.wait_for_network:
                 self._wait_for_network()
@@ -463,6 +464,8 @@ class SFTPUploader(SFTPBase):
                     # 各來源各自維護自己目錄內的版本紀錄檔（rel_path 相對於各自來源根）。
                     local_root = source if source.is_dir() else source.parent
                     self._manifest = self._load_manifest(local_root) if self.resume else {}
+                    self._manifest_dirty = False
+                    current_local_root = local_root
 
                     file_list = None
                     list_attempts = 0
@@ -569,6 +572,9 @@ class SFTPUploader(SFTPBase):
                                 except Exception:
                                     failed.append(rel_path)
                                     break
+
+                    # 這個來源跑完：把累積的「略過」項目一次寫回。
+                    self._flush_manifest(local_root)
         except paramiko.AuthenticationException:
             self.logger.error("=== 任務中止：帳號或密碼錯誤 ===")
             return False
@@ -582,6 +588,11 @@ class SFTPUploader(SFTPBase):
                 action="abort",
             ) + f" === 任務中止：{detail} ===")
             return False
+        finally:
+            # 中止（含 SIGTERM 取消）時，尚未落盤的略過項目也寫回，避免下一趟白跑一次比對。
+            # 正常路徑上面已經寫過，這裡因 _manifest_dirty 為 False 而不會重複寫。
+            if current_local_root is not None:
+                self._flush_manifest(current_local_root)
 
         if multi_job:
             self.logger.info(

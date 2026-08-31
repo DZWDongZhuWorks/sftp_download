@@ -516,6 +516,49 @@ class TestManifestPersistence:
         assert any("寫入失敗" in r.message for r in caplog.records)
 
 
+class TestFlushManifest:
+    """「略過」的項目累積到收尾才一次寫回；需要 checkpoint 的地方仍然當下立刻落盤。"""
+
+    def test_flush_writes_when_dirty(self, downloader_factory, tmp_path):
+        d = downloader_factory()
+        d._manifest = {"a.txt": {"size": 1, "mtime": 2}}
+        d._manifest_dirty = True
+        d._flush_manifest(tmp_path)
+        assert d._load_manifest(tmp_path) == {"a.txt": {"size": 1, "mtime": 2}}
+        assert d._manifest_dirty is False
+
+    def test_flush_is_a_noop_when_nothing_changed(self, downloader_factory, tmp_path):
+        d = downloader_factory()
+        d._manifest = {"a.txt": {"size": 1}}
+        d._flush_manifest(tmp_path)  # _manifest_dirty 預設 False
+        assert not d._manifest_path(tmp_path).exists()
+
+    def test_flush_does_nothing_when_resume_disabled(self, downloader_factory, tmp_path):
+        d = downloader_factory(resume=False)
+        d._manifest = {"a.txt": {"size": 1}}
+        d._manifest_dirty = True
+        d._flush_manifest(tmp_path)
+        assert not d._manifest_path(tmp_path).exists()
+
+    def test_skip_marks_dirty_without_touching_disk(self, downloader_factory, fake_sftp_factory, tmp_path):
+        # 這是本次最佳化的核心：略過一個檔不該產生一次整份 JSON 重寫。
+        (tmp_path / "legacy.bin").write_bytes(b"SAMESIZE12")
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/legacy.bin": b"SAMESIZE99"}, mtimes={"/remote/legacy.bin": 5000})
+        assert d._download_one_file("/remote/legacy.bin", "legacy.bin", tmp_path) == "skipped"
+        assert d._manifest["legacy.bin"] == {"size": 10, "mtime": 5000}
+        assert d._manifest_dirty is True
+        assert not d._manifest_path(tmp_path).exists()  # 尚未落盤
+
+    def test_failed_flush_keeps_the_entries_dirty_for_a_later_retry(self, downloader_factory, tmp_path):
+        d = downloader_factory()
+        d._manifest = {"a.txt": {"size": 1}}
+        d._manifest_dirty = True
+        with patch("builtins.open", side_effect=OSError("disk full")):
+            d._flush_manifest(tmp_path)
+        assert d._manifest_dirty is True
+
+
 # ---------------------------------------------------------------------------
 # _next_duplicate_path
 # ---------------------------------------------------------------------------
@@ -1690,6 +1733,63 @@ class TestRun:
         d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", sftp))
         assert d.run() is True
         assert d.sftp is None
+
+    def test_all_skipped_run_writes_the_manifest_once_not_once_per_file(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        # manifest 是整份重寫的 JSON；岸端同步 fleet_logs 時一趟要略過近 4,000 個檔，
+        # 逐檔落盤實測是 120 秒與 1.9 GB 的寫入量，而且買不到任何東西。
+        files = {"/remote/f%02d.bin" % i: bytes([i]) * (i + 1) for i in range(12)}
+        mtimes = {p: i + 1 for i, p in enumerate(files)}
+        local = tmp_path / "dest"
+        d = downloader_factory(wait_for_network=False, local_path=str(local))
+        d._connect_with_retry = MagicMock(
+            side_effect=lambda: setattr(d, "sftp", fake_sftp_factory(files=files, mtimes=mtimes))
+        )
+        d._close = MagicMock()
+        assert d.run() is True  # 第一次：全新下載
+
+        d._save_manifest = MagicMock(side_effect=d._save_manifest)
+        assert d.run() is True  # 第二次：12 個檔全部略過
+        assert d._save_manifest.call_count == 1
+
+        # 而且該寫的內容確實寫進去了
+        assert set(d._load_manifest(local)) == {"f%02d.bin" % i for i in range(12)}
+
+    def test_cancelled_run_still_persists_the_accumulated_skips(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        files = {"/remote/a.txt": b"A", "/remote/b.txt": b"BB"}
+        mtimes = {"/remote/a.txt": 1, "/remote/b.txt": 2}
+        local = tmp_path / "dest"
+
+        def build():
+            d = downloader_factory(wait_for_network=False, local_path=str(local))
+            d._connect_with_retry = MagicMock(
+                side_effect=lambda: setattr(d, "sftp", fake_sftp_factory(files=files, mtimes=mtimes))
+            )
+            d._close = MagicMock()
+            return d
+
+        assert build().run() is True  # 先把兩個檔下載下來
+        d = build()
+        d._manifest_path(local).unlink()  # 清掉紀錄，讓第二趟重新以「略過」建立
+
+        original = d._download_one_file
+        seen = {"n": 0}
+
+        def cancel_on_second(remote_file, rel_path, local_root, listed_attr=None):
+            seen["n"] += 1
+            if seen["n"] == 2:
+                raise dl.TransferCancelled(15)
+            return original(remote_file, rel_path, local_root, listed_attr)
+
+        d._download_one_file = cancel_on_second
+        with pytest.raises(dl.TransferCancelled):
+            d.run()
+
+        # 第一個檔已經判定略過，收尾的 finally 必須把它寫回，下一趟才不用再比對一次
+        assert len(d._load_manifest(local)) == 1
 
     def test_run_closes_the_connection_even_when_log_upload_raises(
         self, downloader_factory, fake_sftp_factory, tmp_path
