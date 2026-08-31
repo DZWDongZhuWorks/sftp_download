@@ -476,6 +476,36 @@ class TestRun:
         d, fake = self._prepare(uploader_factory, fake_sftp_factory, local_path=str(tmp_path / "nope"))
         assert d.run() is False
 
+    def test_log_upload_reuses_the_transfer_connection(self, uploader_factory, fake_sftp_factory, tmp_path):
+        # 與下載端同一個機制：_run() 不關連線，留給 run() 收尾，log 上傳因此少一次握手。
+        _write(tmp_path / "a.txt", b"aaa")
+        log_file = tmp_path.parent / "run.csv"
+        log_file.write_text("data", encoding="utf-8")
+        fake = fake_sftp_factory(files={})
+        d = uploader_factory(
+            wait_for_network=False,
+            upload_log=True,
+            remote_log_dir="/fleet/logs",
+            log_file=str(log_file),
+        )
+        d.logger.addHandler(logging.NullHandler())
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+
+        assert d.run() is True
+        d._connect_with_retry.assert_called_once()
+        assert "/fleet/logs/run.csv" in fake.files
+        assert d.sftp is None  # 收尾關連線的責任在 run()
+
+    def test_run_closes_the_connection_when_log_upload_is_disabled(
+        self, uploader_factory, fake_sftp_factory, tmp_path
+    ):
+        _write(tmp_path / "a.txt", b"aaa")
+        fake = fake_sftp_factory(files={})
+        d = uploader_factory(wait_for_network=False)
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fake))
+        assert d.run() is True
+        assert d.sftp is None
+
     def test_run_retries_upload_on_connection_error(self, uploader_factory, fake_sftp_factory, tmp_path):
         _write(tmp_path / "a.txt", b"data")
         d, fake = self._prepare(uploader_factory, fake_sftp_factory)

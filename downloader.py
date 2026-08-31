@@ -486,20 +486,49 @@ class SFTPBase:
             except FileNotFoundError:
                 self.sftp.mkdir(current)
 
+    def _put_log_file(self):
+        remote_name = self.remote_log_dir.rstrip("/") + "/" + Path(self.log_file).name
+        self._ensure_remote_dir(self.remote_log_dir)
+        self.sftp.put(str(self.log_file), remote_name)
+        return remote_name
+
     def _upload_log_file(self):
+        """把本地 Log 傳回遠端；能沿用傳輸階段的連線就不再握手一次。
+
+        傳輸結束後不主動關連線（見 run()），所以走到這裡通常還握著可用的 SFTP channel。
+        船上的實測：一次 SSH 握手中位數 5 秒、p90 14 秒，而排程是「一個專案一個行程」，
+        省下的是「專案數 × 一次握手」。沿用的連線可能已經在傳輸中途死掉（無聲斷線、對端
+        關閉），所以 put 失敗時仍會重連一次重試，行為與改版前等價。
+        """
+        reused = self.sftp is not None
         try:
             self.logger.info(diagnostic_message(
                 "LOG_UPLOAD_ATTEMPT",
                 "正在上傳 Log 檔至 SFTP...",
                 local_file=self.log_file,
                 remote_dir=self.remote_log_dir,
+                reused_connection=reused,
             ))
             for handler in self.logger.handlers:
                 handler.flush()
-            self._connect_with_retry()
-            self._ensure_remote_dir(self.remote_log_dir)
-            remote_name = self.remote_log_dir.rstrip("/") + "/" + Path(self.log_file).name
-            self.sftp.put(str(self.log_file), remote_name)
+            if not reused:
+                self._connect_with_retry()
+            try:
+                remote_name = self._put_log_file()
+            except SFTP_RETRY_EXCEPTIONS as e:
+                if not reused:
+                    raise
+                # 沿用的連線已失效：退回改版前的行為（重新連線後再傳一次）。
+                self.logger.warning(diagnostic_message(
+                    "LOG_UPLOAD_RETRY",
+                    f"沿用既有連線上傳 Log 失敗，改為重新連線後重試: {format_exception(e)}",
+                    local_file=self.log_file,
+                    remote_dir=self.remote_log_dir,
+                    error=format_exception(e),
+                    action="reconnect",
+                ))
+                self._connect_with_retry()
+                remote_name = self._put_log_file()
             self.logger.info(diagnostic_message(
                 "LOG_UPLOAD_OK",
                 f"Log 上傳完成: {remote_name}",
@@ -524,7 +553,10 @@ class SFTPBase:
         傳輸成功或一般失敗（帳密錯誤、達重試上限、未預期例外）時，最後都會在 upload_log
         開啟時把 log 上傳回 remote。SIGTERM 取消則只 flush 本地 log、略過遠端 upload，避免
         收尾又進入可能無限等待的網路路徑。log 上傳本身的錯誤已在 _upload_log_file 內部吞掉，
-        不影響回傳值。"""
+        不影響回傳值。
+
+        關連線的責任在這一層（子類別的 _run() 刻意不關），log 上傳才能沿用傳輸階段的連線、
+        省下一次握手。不論走哪條路徑（正常結束、log 上傳失敗、取消）都保證關掉。"""
         cancelled = False
         try:
             return self._run()
@@ -545,8 +577,11 @@ class SFTPBase:
                     pass
             raise
         finally:
-            if self.upload_log and not cancelled:
-                self._upload_log_file()
+            try:
+                if self.upload_log and not cancelled:
+                    self._upload_log_file()
+            finally:
+                self._close()
 
 
 class SFTPDownloader(SFTPBase):
@@ -555,6 +590,11 @@ class SFTPDownloader(SFTPBase):
     manifest_filename = MANIFEST_FILENAME
 
     def _list_remote_files(self, remote_root, local_root):
+        """回傳 [(遠端絕對路徑, rel_path, 走訪時取得的屬性或 None)]。
+
+        第三個元素是 listdir_attr／stat 當下就拿到的 SFTPAttributes，一路帶到
+        _download_one_file，讓每個檔案不必再打一次 stat（見 _resolve_remote_attr）。
+        """
         files = []
         root_stat = self.sftp.stat(remote_root)
         if not stat.S_ISDIR(root_stat.st_mode):
@@ -562,7 +602,7 @@ class SFTPDownloader(SFTPBase):
             if self._is_ignored(filename):
                 self.logger.info(f"依忽略設定檔略過: {filename}")
             else:
-                files.append((remote_root, filename))
+                files.append((remote_root, filename, root_stat))
         elif self.recursive:
             self._walk_remote_dir(remote_root, "", files, local_root)
         else:
@@ -574,7 +614,7 @@ class SFTPDownloader(SFTPBase):
                     self.logger.info(f"依忽略設定檔略過: {entry.filename}")
                 else:
                     remote_path = remote_root.rstrip("/") + "/" + entry.filename
-                    files.append((remote_path, entry.filename))
+                    files.append((remote_path, entry.filename, entry))
             if skipped_dirs:
                 self.logger.info(f"僅下載單層（未啟用多層），略過 {len(skipped_dirs)} 個子資料夾: {', '.join(skipped_dirs)}")
         return files
@@ -596,7 +636,7 @@ class SFTPDownloader(SFTPBase):
             elif self._is_ignored(rel_path):
                 self.logger.info(f"依忽略設定檔略過: {rel_path}")
             else:
-                files.append((remote_path, rel_path))
+                files.append((remote_path, rel_path, entry))
 
     def _next_duplicate_path(self, local_file):
         candidate = local_file.with_name(f"{local_file.stem}_{self.duplicate_suffix}{local_file.suffix}")
@@ -606,10 +646,33 @@ class SFTPDownloader(SFTPBase):
             n += 1
         return candidate
 
-    def _download_one_file(self, remote_file, rel_path, local_root):
+    def _resolve_remote_attr(self, remote_file, listed_attr):
+        """取得遠端檔案的 size/mtime/mode；能沿用走訪時的屬性就不再多打一次 stat。
+
+        listdir_attr 回傳的 SFTPAttributes 本來就含 st_size / st_mtime / st_mode，改版前
+        卻對每個檔案又 stat 一次。在船上的高延遲鏈路，那一次來回正是「內容根本沒變動的
+        檔案」最主要的成本（船隊 log 實測：每個略過的檔案中位 0.87 秒、p90 1.77 秒）。
+
+        兩種情況仍必須實打 stat，否則語意會變：
+          * symlink —— readdir 給的是連結自身的 lstat（st_size 是目標路徑字串的長度），
+            而本工具一貫的語意是跟著連結看實體內容（對稱於 uploader._handle_symlink）。
+          * 伺服器沒帶齊 mode/size/mtime —— SFTP 協定允許省略這些欄位。
+        """
+        if listed_attr is not None:
+            mode = getattr(listed_attr, "st_mode", None)
+            if (
+                mode is not None
+                and not stat.S_ISLNK(mode)
+                and getattr(listed_attr, "st_size", None) is not None
+                and getattr(listed_attr, "st_mtime", None) is not None
+            ):
+                return listed_attr
+        return self.sftp.stat(remote_file)
+
+    def _download_one_file(self, remote_file, rel_path, local_root, listed_attr=None):
         local_file = local_root / Path(*rel_path.split("/"))
         local_file.parent.mkdir(parents=True, exist_ok=True)
-        remote_stat = self.sftp.stat(remote_file)
+        remote_stat = self._resolve_remote_attr(remote_file, listed_attr)
         remote_size = remote_stat.st_size
         remote_mtime = int(remote_stat.st_mtime)
 
@@ -890,6 +953,8 @@ class SFTPDownloader(SFTPBase):
         try:
             if self.wait_for_network:
                 self._wait_for_network()
+            # 這條連線刻意留給 run() 關閉：中間隔著收尾的 log 行與 log 上傳，讓後者能沿用
+            # 同一條連線、少一次 SSH 握手。所有離開路徑都在 run() 的 finally 被關掉。
             self._connect_with_retry()
 
             for job_sources, local_root in jobs:
@@ -940,11 +1005,14 @@ class SFTPDownloader(SFTPBase):
                 # 同一 job 內多來源合併時，若不同來源含有相同的相對路徑，後面的來源會覆蓋前面的
                 # （版本紀錄也以後者為準），僅保留最後一筆並記錄警告。
                 deduped = {}
-                for remote_file, rel_path in file_list:
-                    if rel_path in deduped and deduped[rel_path] != remote_file:
+                for remote_file, rel_path, listed_attr in file_list:
+                    if rel_path in deduped and deduped[rel_path][0] != remote_file:
                         self.logger.warning(f"多個來源路徑都含有 {rel_path}，以後面的來源為準: {remote_file}")
-                    deduped[rel_path] = remote_file
-                file_list = [(remote_file, rel_path) for rel_path, remote_file in deduped.items()]
+                    deduped[rel_path] = (remote_file, listed_attr)
+                file_list = [
+                    (remote_file, rel_path, listed_attr)
+                    for rel_path, (remote_file, listed_attr) in deduped.items()
+                ]
 
                 if multi_job:
                     self.logger.info(f"{job_sources[0]} → {local_root}，發現 {len(file_list)} 個檔案")
@@ -953,11 +1021,11 @@ class SFTPDownloader(SFTPBase):
                 else:
                     self.logger.info(f"共發現 {len(file_list)} 個檔案")
 
-                for remote_file, rel_path in file_list:
+                for remote_file, rel_path, listed_attr in file_list:
                     attempts = 0
                     while True:
                         try:
-                            result = self._download_one_file(remote_file, rel_path, local_root)
+                            result = self._download_one_file(remote_file, rel_path, local_root, listed_attr)
                             if result == "skipped":
                                 skipped += 1
                             else:
@@ -1016,6 +1084,10 @@ class SFTPDownloader(SFTPBase):
                                 ))
                                 failed.append(rel_path)
                                 break
+                            # 重連後重來一次時丟掉走訪當下的屬性，改回實打 stat：清單是任務
+                            # 一開始一次列完的，重試代表這中間已經歷過一段網路中斷，來源
+                            # 版本是否還是同一份不該再用舊屬性斷定（manifest 會記下它）。
+                            listed_attr = None
                             try:
                                 self._connect_with_retry()
                             except Exception:
@@ -1034,8 +1106,6 @@ class SFTPDownloader(SFTPBase):
                 action="abort",
             ) + f" === 任務中止：{detail} ===")
             return False
-        finally:
-            self._close()
 
         if multi_job:
             self.logger.info(

@@ -293,7 +293,7 @@ class TestListRemoteFiles:
         d = downloader_factory(remote_path="/remote/report.csv")
         d.sftp = fake_sftp_factory(files={"/remote/report.csv": b"data"})
         files = d._list_remote_files("/remote/report.csv", tmp_path)
-        assert files == [("/remote/report.csv", "report.csv")]
+        assert [(remote, rel) for remote, rel, _ in files] == [("/remote/report.csv", "report.csv")]
 
     def test_recursive_directory_lists_all_nested_files(self, downloader_factory, fake_sftp_factory, tmp_path):
         d = downloader_factory(recursive=True)
@@ -303,7 +303,7 @@ class TestListRemoteFiles:
             "/remote/sub/deeper/c.txt": b"c",
         })
         files = d._list_remote_files("/remote", tmp_path)
-        rels = sorted(rel for _, rel in files)
+        rels = sorted(rel for _, rel, _attr in files)
         assert rels == ["a.txt", "sub/b.txt", "sub/deeper/c.txt"]
 
     def test_recursive_creates_empty_subdirectories_locally(self, downloader_factory, fake_sftp_factory, tmp_path):
@@ -321,14 +321,14 @@ class TestListRemoteFiles:
         sftp.listdir_attr = listdir_with_empty_dir
         d.sftp = sftp
         files = d._list_remote_files("/remote", tmp_path)
-        assert [rel for _, rel in files] == ["a.txt"]
+        assert [rel for _, rel, _attr in files] == ["a.txt"]
         assert (tmp_path / "empty_sub").is_dir()
 
     def test_single_level_mode_skips_subdirectories(self, downloader_factory, fake_sftp_factory, tmp_path):
         d = downloader_factory(recursive=False)
         d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"a", "/remote/sub/b.txt": b"b"})
         files = d._list_remote_files("/remote", tmp_path)
-        assert [rel for _, rel in files] == ["a.txt"]
+        assert [rel for _, rel, _attr in files] == ["a.txt"]
 
     def test_single_level_mode_logs_skipped_directory_count(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
         d = downloader_factory(recursive=False)
@@ -404,7 +404,7 @@ class TestIgnoreSpec:
             "/remote/sub/d.txt": b"d",
         })
         files = d._list_remote_files("/remote", tmp_path)
-        assert sorted(rel for _, rel in files) == ["a.txt", "sub/d.txt"]
+        assert sorted(rel for _, rel, _attr in files) == ["a.txt", "sub/d.txt"]
 
     def test_recursive_listing_prunes_ignored_directory_entirely(self, downloader_factory, fake_sftp_factory, tmp_path, caplog):
         d = self._make_with_ignore(downloader_factory, tmp_path, "logs/\n", recursive=True)
@@ -415,7 +415,7 @@ class TestIgnoreSpec:
         })
         with caplog.at_level(logging.INFO):
             files = d._list_remote_files("/remote", tmp_path)
-        assert [rel for _, rel in files] == ["a.txt"]
+        assert [rel for _, rel, _attr in files] == ["a.txt"]
         # 整棵資料夾剪枝：本地端不建立被忽略的資料夾
         assert not (tmp_path / "logs").exists()
         assert any("略過資料夾" in r.message for r in caplog.records)
@@ -424,7 +424,7 @@ class TestIgnoreSpec:
         d = self._make_with_ignore(downloader_factory, tmp_path, "*.tmp\n", recursive=False)
         d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"a", "/remote/b.tmp": b"b"})
         files = d._list_remote_files("/remote", tmp_path)
-        assert [rel for _, rel in files] == ["a.txt"]
+        assert [rel for _, rel, _attr in files] == ["a.txt"]
 
     def test_single_remote_file_matching_rule_is_ignored(self, downloader_factory, fake_sftp_factory, tmp_path):
         d = self._make_with_ignore(downloader_factory, tmp_path, "report.csv\n")
@@ -1088,6 +1088,60 @@ class TestDownloadNeverWritesDestinationInPlace:
 
 
 # ---------------------------------------------------------------------------
+# _resolve_remote_attr — 沿用走訪屬性、省下每檔一次 stat 來回
+# ---------------------------------------------------------------------------
+
+class TestResolveRemoteAttr:
+    def test_listed_attribute_is_reused_without_calling_stat(self, downloader_factory, fake_sftp_factory):
+        d = downloader_factory()
+        sftp = fake_sftp_factory(files={"/remote/a.txt": b"AAA"}, mtimes={"/remote/a.txt": 9})
+        sftp.stat = MagicMock(side_effect=AssertionError("不應該再 stat 一次"))
+        d.sftp = sftp
+        listed = FakeSFTPAttr("a.txt", is_dir=False, size=3, mtime=9)
+        assert d._resolve_remote_attr("/remote/a.txt", listed) is listed
+
+    def test_no_listed_attribute_falls_back_to_stat(self, downloader_factory, fake_sftp_factory):
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"AAA"}, mtimes={"/remote/a.txt": 9})
+        attr = d._resolve_remote_attr("/remote/a.txt", None)
+        assert (attr.st_size, attr.st_mtime) == (3, 9)
+
+    def test_symlink_entry_falls_back_to_stat_to_follow_the_link(self, downloader_factory, fake_sftp_factory):
+        # readdir 對 symlink 給的是連結自身的 lstat（size 是目標路徑字串長度），
+        # 本工具的語意是跟著連結看實體，所以這種項目必須實打 stat。
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/link": b"REAL-CONTENT"}, mtimes={"/remote/link": 5})
+        listed = FakeSFTPAttr("link", is_dir=False, size=7, mtime=1)
+        listed.st_mode = stat.S_IFLNK | 0o777
+        attr = d._resolve_remote_attr("/remote/link", listed)
+        assert (attr.st_size, attr.st_mtime) == (len(b"REAL-CONTENT"), 5)
+
+    @pytest.mark.parametrize("missing", ["st_mode", "st_size", "st_mtime"])
+    def test_incomplete_listed_attribute_falls_back_to_stat(
+        self, downloader_factory, fake_sftp_factory, missing
+    ):
+        # SFTP 協定允許伺服器省略這些欄位；缺任何一個就不能拿來當判斷依據。
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"AAA"}, mtimes={"/remote/a.txt": 9})
+        listed = FakeSFTPAttr("a.txt", is_dir=False, size=3, mtime=9)
+        setattr(listed, missing, None)
+        attr = d._resolve_remote_attr("/remote/a.txt", listed)
+        assert attr is not listed
+        assert (attr.st_size, attr.st_mtime) == (3, 9)
+
+    def test_download_uses_listed_attribute_for_the_skip_decision(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        d = downloader_factory()
+        sftp = fake_sftp_factory(files={"/remote/f.bin": b"12345"}, mtimes={"/remote/f.bin": 4})
+        d.sftp = sftp
+        listed = FakeSFTPAttr("f.bin", is_dir=False, size=5, mtime=4)
+        assert d._download_one_file("/remote/f.bin", "f.bin", tmp_path, listed) == "downloaded"
+        sftp.stat = MagicMock(side_effect=AssertionError("略過判斷不該再 stat"))
+        assert d._download_one_file("/remote/f.bin", "f.bin", tmp_path, listed) == "skipped"
+
+
+# ---------------------------------------------------------------------------
 # _upload_log_file
 # ---------------------------------------------------------------------------
 
@@ -1154,6 +1208,66 @@ class TestUploadLogFile:
         d._close = MagicMock()
         d._upload_log_file()
         d._close.assert_called_once()
+
+    def test_existing_connection_is_reused_instead_of_handshaking_again(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        log_file = tmp_path / "run.csv"
+        log_file.write_text("data", encoding="utf-8")
+        d = downloader_factory(remote_log_dir="/data/logs", log_file=str(log_file))
+        d.logger.addHandler(logging.NullHandler())
+        d._connect_with_retry = MagicMock()
+        d.sftp = fake_sftp_factory(files={})
+        d._upload_log_file()
+        d._connect_with_retry.assert_not_called()
+
+    def test_without_a_connection_it_still_connects(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        log_file = tmp_path / "run.csv"
+        log_file.write_text("data", encoding="utf-8")
+        sftp = fake_sftp_factory(files={})
+        d = downloader_factory(remote_log_dir="/data/logs", log_file=str(log_file))
+        d.logger.addHandler(logging.NullHandler())
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", sftp))
+        d.sftp = None
+        d._upload_log_file()
+        d._connect_with_retry.assert_called_once()
+        assert "/data/logs/run.csv" in sftp.files
+
+    def test_dead_reused_connection_reconnects_once_and_still_uploads(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        # 沿用的連線可能在傳輸中途就無聲斷掉；此時必須退回「重新連線再傳」的舊行為。
+        log_file = tmp_path / "run.csv"
+        log_file.write_text("data", encoding="utf-8")
+        dead = fake_sftp_factory(files={})
+        dead.put = MagicMock(side_effect=OSError("Socket is closed"))
+        fresh = fake_sftp_factory(files={})
+        d = downloader_factory(remote_log_dir="/data/logs", log_file=str(log_file))
+        d.logger.addHandler(logging.NullHandler())
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", fresh))
+        d.sftp = dead
+        d._upload_log_file()
+        d._connect_with_retry.assert_called_once()
+        assert "/data/logs/run.csv" in fresh.files
+
+    def test_failure_on_a_fresh_connection_is_not_retried_again(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        log_file = tmp_path / "run.csv"
+        log_file.write_text("data", encoding="utf-8")
+        sftp = fake_sftp_factory(files={})
+        sftp.put = MagicMock(side_effect=OSError("Socket is closed"))
+        d = downloader_factory(remote_log_dir="/data/logs", log_file=str(log_file))
+        d.logger.addHandler(logging.NullHandler())
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", sftp))
+        d.sftp = None
+        with caplog.at_level(logging.INFO):
+            d._upload_log_file()
+        d._connect_with_retry.assert_called_once()
+        assert sftp.put.call_count == 1
+        assert any("LOG_UPLOAD_ERROR" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1349,10 +1463,10 @@ class TestRun:
         )
         original_download = d._download_one_file
 
-        def flaky_download(remote_file, rel_path, local_root):
+        def flaky_download(remote_file, rel_path, local_root, listed_attr=None):
             if rel_path == "a.txt":
                 raise PermissionError("no write access")
-            return original_download(remote_file, rel_path, local_root)
+            return original_download(remote_file, rel_path, local_root, listed_attr)
 
         d._download_one_file = flaky_download
         result = d.run()
@@ -1369,11 +1483,11 @@ class TestRun:
         original_download = d._download_one_file
         state = {"failed_once": False}
 
-        def flaky_download(remote_file, rel_path, local_root):
+        def flaky_download(remote_file, rel_path, local_root, listed_attr=None):
             if not state["failed_once"]:
                 state["failed_once"] = True
                 raise OSError("dropped")
-            return original_download(remote_file, rel_path, local_root)
+            return original_download(remote_file, rel_path, local_root, listed_attr)
 
         d._download_one_file = flaky_download
         result = d.run()
@@ -1391,11 +1505,11 @@ class TestRun:
         original_download = d._download_one_file
         state = {"failed_once": False}
 
-        def flaky_download(remote_file, rel_path, local_root):
+        def flaky_download(remote_file, rel_path, local_root, listed_attr=None):
             if not state["failed_once"]:
                 state["failed_once"] = True
                 raise paramiko.SFTPError("Garbage packet received")
-            return original_download(remote_file, rel_path, local_root)
+            return original_download(remote_file, rel_path, local_root, listed_attr)
 
         d._download_one_file = MagicMock(side_effect=flaky_download)
         assert d.run() is True
@@ -1410,10 +1524,10 @@ class TestRun:
         )
         original_download = d._download_one_file
 
-        def flaky_download(remote_file, rel_path, local_root):
+        def flaky_download(remote_file, rel_path, local_root, listed_attr=None):
             if rel_path == "a.txt":
                 raise OSError("permanently broken")
-            return original_download(remote_file, rel_path, local_root)
+            return original_download(remote_file, rel_path, local_root, listed_attr)
 
         d._download_one_file = flaky_download
         result = d.run()
@@ -1432,11 +1546,11 @@ class TestRun:
         original_connect = d._connect_with_retry
         state = {"a_failed": False}
 
-        def flaky_download(remote_file, rel_path, local_root):
+        def flaky_download(remote_file, rel_path, local_root, listed_attr=None):
             if rel_path == "a.txt" and not state["a_failed"]:
                 state["a_failed"] = True
                 raise OSError("dropped")
-            return original_download(remote_file, rel_path, local_root)
+            return original_download(remote_file, rel_path, local_root, listed_attr)
 
         def reconnect_side_effect():
             if state["a_failed"]:
@@ -1524,6 +1638,74 @@ class TestRun:
 
         d._close.assert_called_once()
         d._upload_log_file.assert_not_called()
+
+    def test_whole_run_stats_the_source_root_only_not_every_file(
+        self, downloader_factory, fake_sftp_factory
+    ):
+        # 走訪用的 listdir_attr 已經帶回 size/mtime/mode，逐檔不該再各打一次 stat。
+        # 高延遲鏈路上那一次來回正是「內容沒變動的檔案」最主要的成本。
+        sftp = fake_sftp_factory(
+            files={"/remote/a.txt": b"A", "/remote/sub/b.txt": b"B", "/remote/sub/c.txt": b"C"},
+            mtimes={"/remote/a.txt": 1, "/remote/sub/b.txt": 2, "/remote/sub/c.txt": 3},
+        )
+        sftp.stat = MagicMock(side_effect=sftp.stat)
+        d = downloader_factory(wait_for_network=False, recursive=True)
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", sftp))
+        d._close = MagicMock()
+
+        assert d.run() is True
+        assert sftp.stat.call_count == 1  # 只有 _list_remote_files 判斷來源是檔案或目錄的那次
+
+        assert d.run() is True  # 第二次全部略過，同樣不該多出任何 stat
+        assert sftp.stat.call_count == 2
+
+    def test_log_upload_reuses_the_transfer_connection(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        # 改版前這裡會握手兩次（傳輸一次、log 上傳一次）；船上一次握手中位 5 秒，
+        # 而排程是一個專案一個行程，省下的是「專案數 × 一次握手」。
+        log_file = tmp_path / "run.csv"
+        log_file.write_text("data", encoding="utf-8")
+        sftp = fake_sftp_factory(files={"/remote/a.txt": b"A"}, mtimes={"/remote/a.txt": 1})
+        d = downloader_factory(
+            wait_for_network=False,
+            local_path=str(tmp_path / "dest"),
+            upload_log=True,
+            remote_log_dir="/fleet/logs",
+            log_file=str(log_file),
+        )
+        d.logger.addHandler(logging.NullHandler())
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", sftp))
+
+        assert d.run() is True
+        d._connect_with_retry.assert_called_once()
+        assert "/fleet/logs/run.csv" in sftp.files
+        assert d.sftp is None  # 收尾關連線的責任在 run()
+
+    def test_run_closes_the_connection_when_log_upload_is_disabled(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        sftp = fake_sftp_factory(files={"/remote/a.txt": b"A"}, mtimes={"/remote/a.txt": 1})
+        d = downloader_factory(wait_for_network=False, local_path=str(tmp_path / "dest"))
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", sftp))
+        assert d.run() is True
+        assert d.sftp is None
+
+    def test_run_closes_the_connection_even_when_log_upload_raises(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        sftp = fake_sftp_factory(files={"/remote/a.txt": b"A"}, mtimes={"/remote/a.txt": 1})
+        d = downloader_factory(
+            wait_for_network=False,
+            local_path=str(tmp_path / "dest"),
+            upload_log=True,
+            remote_log_dir="/fleet/logs",
+        )
+        d._connect_with_retry = MagicMock(side_effect=lambda: setattr(d, "sftp", sftp))
+        d._upload_log_file = MagicMock(side_effect=RuntimeError("boom"))
+        with pytest.raises(RuntimeError):
+            d.run()
+        assert d.sftp is None
 
 
 # ---------------------------------------------------------------------------

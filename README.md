@@ -107,6 +107,12 @@ export SFTP_PASSWORD="your_password"
 
 > GUI 一次仍只會執行單一組來源/本地路徑，但可以用左上角的「載入設定檔...」按鈕手動切換要用 `settings_A.json` 還是 `settings_B.json` 再按「開始下載」，適合手動操作的情境；**排程自動化仍建議用上述 CLI + `--config` 的方式**，讓每組路徑各自跑一個排程任務，不需要人在旁邊切換。
 
+### 連線次數
+
+一次執行只會建立**一條** SFTP 連線：同一份設定檔內的所有來源路徑共用它，回傳 Log（`upload_log`）也沿用同一條，不會為了傳 Log 再握手一次（log 訊息中的 `reused_connection=true` 即代表沿用成功）。只有連線在傳輸中途斷掉時才會重連——自動重連本來就會這麼做。
+
+跨設定檔則仍是各自獨立的行程、各自一條連線，這是刻意的：一個專案失敗不影響其他專案，各自有自己的 Log、結束代碼與重試上限。衛星鏈路上一次 SSH 握手約 5～15 秒，若專案數量很多而想再省，優先考慮的是減少設定檔數量（把同主機、同節奏的來源合併成一份多來源設定），而不是讓所有專案共用單一連線。
+
 ---
 
 ## 【設定檔 settings.json（可省略重複輸入參數）】
@@ -411,6 +417,7 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 | `RESUME_REJECTED` | 續傳被拒絕；包含精確原因、雙方大小、checkpoint offset 與 hash 是否存在 |
 | `CHECKPOINT_SAVED` | 取消或傳輸錯誤後保存的進度、signal、offset 與 manifest 寫入結果 |
 | `LIST_RETRY` / `TRANSFER_RETRY` / `TRANSFER_ERROR` | 清單、單檔傳輸的階段、重試資訊、例外及最終動作 |
+| `LOG_UPLOAD_ATTEMPT` / `LOG_UPLOAD_RETRY` | 回傳 Log 的目的地，以及 `reused_connection`（是否沿用傳輸階段的連線，見下方【連線次數】）；沿用的連線失效時會出現 `LOG_UPLOAD_RETRY` 並重連一次 |
 
 `RESUME_REJECTED` 的常見 `reason`：
 
