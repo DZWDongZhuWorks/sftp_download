@@ -449,6 +449,8 @@ class SFTPUploader(SFTPBase):
         try:
             if self.wait_for_network:
                 self._wait_for_network()
+            # 這條連線刻意留給 run() 關閉：中間隔著收尾的 log 行與 log 上傳，讓後者能沿用
+            # 同一條連線、少一次 SSH 握手。所有離開路徑都在 run() 的 finally 被關掉。
             self._connect_with_retry()
 
             for job_sources, remote_root in jobs:
@@ -580,8 +582,6 @@ class SFTPUploader(SFTPBase):
                 action="abort",
             ) + f" === 任務中止：{detail} ===")
             return False
-        finally:
-            self._close()
 
         if multi_job:
             self.logger.info(
