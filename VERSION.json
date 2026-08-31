@@ -1,7 +1,7 @@
 {
-  "version": "0.10.2",
+  "version": "0.10.3",
   "date": "2026-08-31",
-  "notes": "manifest 的略過項目改為每組工作收尾一次寫回，不再逐檔全量重寫",
+  "notes": "README 校正：Python 下限改回 3.6、補上 config/script/monitor/deploy 與離線部署入口、測試涵蓋清單與 GUI 說明對齊實作",
   "stamp_exclude": [
     "*.whl"
   ]

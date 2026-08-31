@@ -1,4 +1,4 @@
-# SFTP 自動化下載工具
+# SFTP 自動化傳輸工具（下載／上傳）
 
 **語言選擇：Python**（跨平台支援 Windows/Linux 最成熟，`paramiko` 套件內建 SFTP 客戶端，`tkinter` 為 Python 內建 GUI 套件不需額外安裝，CLI 用標準庫 `argparse` 即可，最符合「同時支援 CLI 與 GUI、跨平台」的需求）。
 
@@ -10,20 +10,26 @@
 - `uploader.py`：上傳核心邏輯（`SFTPUploader`，繼承 `SFTPBase`），與下載對稱：遞迴走訪本地目錄、斷點續傳、忽略規則與版本紀錄。
 - `pack_upload.py`：讀取既有 upload 設定，但不連線 SFTP；把同一批待上傳內容封裝成可攜式本地 `.tar`。
 - `gitignore.py`：「忽略設定檔」的 gitignore 規則比對（純 Python 標準庫實作，不需安裝額外套件）。
-- `gui.py`：圖形化介面（右上角可切換「下載／上傳」模式）。
+- `gui.py`：圖形化介面（頂端工具列可切換「下載／上傳」模式）。
 - `settings.py`：設定檔（`settings.json`）讀取/開啟工具，CLI 與 GUI 共用。
 - `example_settings.json`：下載設定檔範本，複製改名為 `settings.json` 後填入實際值即可使用。
 - `example_upload_settings.json`：上傳設定檔範本（`mode` 為 `upload`）。
 - `run_all_downloads.py` / `run_all_uploads.py`：分別遍歷 `config/` 內 `*_download_settings.json` / `*_upload_settings.json` 並依序執行。
 - `run_selected_transfers.py`（或 `script/run_selected_transfers.sh`）：以 curses 掃描上述兩類設定檔，讓操作者勾選本次真正要執行的下載／上傳專案。
 - `example_download_ignore.txt`：「忽略設定檔」範本，複製改名後依需求增刪規則即可使用。
-- `tests/`：pytest 單元測試（`downloader.py`／`uploader.py`／`gitignore.py`／`settings.py`／`main.py`），詳見下方【開發：執行單元測試】。
+- `version_stamp.py`：版本標記產生器，把 `VERSION.json` 的宣告加上 git 狀態與每個待上傳檔案的 sha256 寫成 `VERSION.stamp.json`，詳見下方【版本標記】。
+- `VERSION.json`：本工具自己宣告的版號（與 git tag 對齊）；`VERSION.stamp.json` 是它的產物，已排除於版本控制外。
+- `config/`：實際部署用的各專案設定檔與忽略檔（`*_download_settings.json`／`*_upload_settings.json`／`*_ignore.txt`）。內含帳密，已列在 `.gitignore` 不進版本控制。
+- `script/`：各專案的排程包裝腳本（`run_*.sh`），一律先 `cd` 到本工具資料夾再呼叫對應的 Python 進入點，因此設定檔內的相對路徑是機器無關的。
+- `monitor/`：傳輸 Log 的監視分析工具（終端機分群列表、自包含 HTML 報告、curses TUI）。唯讀、只依賴標準函式庫，詳見 [`monitor/README.md`](monitor/README.md)。
+- `deploy/`：完全無對外網路環境用的離線部署包（依平台分流的 wheelhouse、tmux、安裝腳本），詳見 [`deploy/README.md`](deploy/README.md)。
+- `tests/`：pytest 單元測試，詳見下方【開發：執行單元測試】。
 
 ---
 
 ## 【環境初始化（僅第一次需要）】
 
-1. 安裝 Python 3.9 以上版本
+1. 安裝 Python 3.6 以上版本
    - Windows：至 [python.org](https://www.python.org/downloads/) 下載安裝，安裝時勾選「Add python.exe to PATH」
    - Linux：多數發行版已內建，若無請執行 `sudo apt install python3 python3-pip python3-tk`（`python3-tk` 為 GUI 模式所需）
 2. 安裝套件（在本工具的資料夾內執行）：
@@ -32,6 +38,16 @@
    ```
 
 以上完成後，之後每次執行都不需要重新安裝。
+
+> **為什麼下限是 3.6 而不是更新的版本**：船端 Bionic 機器的系統 Python 就是 CPython 3.6，
+> 而本工具不攜帶也不安裝 Python runtime。因此所有會上船的原始碼都必須維持 3.6 語法相容
+> （`tests/test_offline_deploy.py` 的 `ShipInterpreterCompatTests` 會全掃原始碼把關，
+> 例如 `subprocess` 只能用 `universal_newlines=` 而不能用 3.7 才有的 `text=`）。
+> Jammy 機器則是 3.10，兩者共用同一份原始碼。
+
+> **無對外網路的環境**：船上不會有 `pip install` 可用，請改用 `deploy/` 底下的離線部署包
+> （`./deploy/deploy_offline.sh`），它依 `/etc/os-release` 自動選擇 Bionic／Jammy 的
+> wheelhouse，安裝前會先做 preflight，相依缺項當場擋下。詳見 [`deploy/README.md`](deploy/README.md)。
 
 ---
 
@@ -49,7 +65,7 @@ python main.py
 
 視窗會依螢幕解析度自動決定初始大小，也可自由拉伸縮放；若螢幕較小、內容顯示不下，畫面右側會出現捲軸（也支援滑鼠滾輪），往下捲動即可看到其餘欄位，不會有欄位被裁切、點不到的問題。
 
-右上角的「開啟設定檔」按鈕會開啟**目前已載入**的那份設定檔（未手動切換過的話就是預設的 `settings.json`）供編輯；若尚未有對應檔案，會先用目前畫面上的值建立一份。編輯儲存後，回到程式按「載入設定檔...」重新選一次同一份檔案即可套用變更，不需要重新啟動程式。
+同一列的「開啟設定檔」按鈕會開啟**目前已載入**的那份設定檔（未手動切換過的話就是預設的 `settings.json`）供編輯；若尚未有對應檔案，會先用目前畫面上的值建立一份。編輯儲存後，回到程式按「載入設定檔...」重新選一次同一份檔案即可套用變更，不需要重新啟動程式。
 
 「匯出設定檔...」按鈕可把**目前畫面上填的所有欄位值**匯出成一份新的 JSON 設定檔（會先跳出視窗讓你選擇存檔位置與檔名）。適合在 GUI 上調整、試跑確認參數沒問題後，直接產出設定檔給排程 CLI（`--config`）使用，或複製給其他裝置當範本，不需要手動照欄位表逐項編寫。GUI 上沒有對應欄位的設定（如 `key_file`、`retry_count`、`ignore_file`）會沿用目前已載入設定檔中的值，未載入過則使用預設值。**注意**：畫面上的 SFTP 密碼會以明碼一併寫入匯出的檔案（同 `settings.json` 的安全性提醒）。
 
@@ -127,7 +143,7 @@ Copy-Item example_settings.json settings.json
 cp example_settings.json settings.json
 ```
 
-- GUI 畫面右上角有「開啟設定檔」按鈕：若尚未有 `settings.json`，會先用目前畫面上已填的值建立一份，再用系統預設程式（如記事本）開啟；編輯儲存後**需重新啟動程式**才會套用。
+- GUI 畫面頂端工具列有「開啟設定檔」按鈕：若尚未有 `settings.json`，會先用目前畫面上已填的值建立一份，再用系統預設程式（如記事本）開啟；編輯儲存後按「載入設定檔...」重新選一次同一份檔案即可套用，不需要重新啟動程式。
 - CLI 沒有對應按鈕，請直接用文字編輯器開啟工具資料夾內的 `settings.json` 編輯。
 - 開關類參數的 CLI 覆蓋方式是「單向」的：`--no-auto-reconnect` 只能把設定檔中的 `true` 覆蓋成停用，無法用 CLI 把設定檔中已停用的功能臨時開啟；若要改變開關狀態，直接修改 `settings.json` 最單純。
 - **安全性提醒**：`password` 欄位若填寫，會以明碼存在 `settings.json` 中，方便無人值守的排程執行；若環境允許，建議改用 `key_file`（SSH 私鑰）取代密碼，或至少限制此資料夾的存取權限，避免密碼外洩。
@@ -210,7 +226,7 @@ python pack_upload.py \
 
 設定檔：複製 `example_upload_settings.json` 作為範本（其中 `mode` 已設為 `upload`），依實際值填入後另存到 `config/` 內、檔名以 `_upload_settings.json` 結尾。
 
-GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地欄位標籤會自動對調（本地端來源路徑、SFTP 目的地路徑），按「開始上傳」即可。
+GUI：啟動後於頂端工具列的「模式」切換到「上傳」，來源/目的地欄位標籤會自動對調（本地端來源路徑、SFTP 目的地路徑），按「開始上傳」即可。
 
 排程整批執行（船上更新）：
 - `python run_all_uploads.py`（或 `script/run_all_uploads.sh`）：只挑選 `config/` 內 `*_upload_settings.json` 依序上傳。
@@ -277,7 +293,7 @@ GUI：啟動後於右上角「模式」切換到「上傳」，來源/目的地�
   "log_remote_dir": "/fleet/wanhai_nssms_deploy/{vsl_name}/{ipc}/sftp_logs"
 }
 ```
-在 WH289 的 IPC-1 上會展開成 `WH289_IPC-1_SFTP_DOWNLOADER` 與 `/fleet/wanhai_nssms_deploy/WH289/IPC-1/sftp_logs`。同一份設定檔即可部署到所有船，不需逐台修改；`device_name` 用佔位符後，`init_device_name.py` 的初始化步驟也不再是必要的。
+在 WH289 的 IPC-1 上會展開成 `WH289_IPC-1_SFTP_DOWNLOADER` 與 `/fleet/wanhai_nssms_deploy/WH289/IPC-1/sftp_logs`。同一份設定檔即可部署到所有船，不需逐台修改；`device_name` 用佔位符後，也不再需要任何逐台改名的初始化步驟。
 
 - 佔位符名稱即 `vessel_basic_info.json` 內的 key，日後該檔案新增欄位即可直接當新佔位符使用。
 - **錯誤即中止**：設定檔有用到佔位符、但船舶資訊檔不存在／JSON 壞掉／找不到對應 key（例如打錯字 `{vslname}`）時，任務直接失敗並說明原因，避免把 `{vsl_name}` 字面文字當成路徑上傳到伺服器產生髒目錄。
@@ -464,7 +480,7 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 
 **manifest 就是「這次真正會上傳的檔案」**：`version_stamp.py` 直接沿用 `pack_upload.build_archive_plan()`，也就是 `SFTPUploader` 的選檔邏輯加上同一份 `ignore_file`。所以不存在「第二份排除清單要跟 upload ignore 同步」的問題。
 
-> **本工具自己也吃這一套**：`sftp_transfer/VERSION.json` 宣告自己的版號（與 git tag 對齊），所以自我更新（`run_sftp_self_update.sh`）的 log 也會帶上版本。`stamp_exclude` 只列了 `*.whl` —— `deploy/` 底下的 47 個離線輪子約 25 MB，是安裝期產物，不算程式碼身分；扣掉後 manifest 是 125 個檔、約 1.9 MB。
+> **本工具自己也吃這一套**：`sftp_transfer/VERSION.json` 宣告自己的版號（與 git tag 對齊），所以自我更新（`run_sftp_self_update.sh`）的 log 也會帶上版本。`stamp_exclude` 只列了 `*.whl` —— `deploy/` 底下的 47 個離線輪子約 25 MB，是安裝期產物，不算程式碼身分；扣掉後 manifest 是 124 個檔、約 1.9 MB（撰文時的數字，會隨程式碼增減浮動）。
 
 #### 什麼時候要升版號（每個 repo 都適用）
 
@@ -519,7 +535,20 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 
 ## 【開發：執行單元測試】
 
-本工具附有 `tests/` 資料夾內的 pytest 單元測試（涵蓋 `downloader.py`、`uploader.py`、`settings.py`、`main.py`），所有網路/檔案 I/O 都經過 Mock，不會真的連線到 SFTP 伺服器，可安心在任何環境執行。這份章節只有要修改程式碼或想確認改動沒有破壞既有行為時才需要，一般日常使用不需要理會。
+本工具附有 `tests/` 資料夾內的 pytest 單元測試，所有網路/檔案 I/O 都經過 Mock，不會真的連線到 SFTP 伺服器，可安心在任何環境執行。涵蓋範圍：
+
+| 測試檔 | 涵蓋 |
+|---|---|
+| `test_downloader.py` / `test_uploader.py` | 傳輸核心：連線重試、斷點續傳、版本紀錄、忽略規則 |
+| `test_main.py` / `test_settings.py` | CLI 參數與設定檔優先權、佔位符展開、路徑守門 |
+| `test_gitignore.py` | 忽略規則的 gitignore 語法比對 |
+| `test_pack_upload.py` | 封裝成本地 tar（含符號連結與權限處理） |
+| `test_version_stamp.py` | 版本標記（`VERSION.json` → `VERSION.stamp.json`） |
+| `test_run_selected_transfers.py` | 人工挑選選單的方向鎖與 `trans_type` 守門 |
+| `test_log_monitor.py` / `test_tui.py` | `monitor/` 的 log 解析、分群與 curses 介面 |
+| `test_offline_deploy.py` / `test_automation_health_check.py` | `deploy/` 的平台分流、wheel 相容性，以及會上船原始碼的 **Python 3.6 語法守門** |
+
+這份章節只有要修改程式碼或想確認改動沒有破壞既有行為時才需要，一般日常使用不需要理會。
 
 1. 安裝測試相依套件（僅需一次）：
    ```
@@ -531,11 +560,11 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
    ```
 3. 執行測試並在終端機顯示覆蓋率報告（含未覆蓋的行號）：
    ```
-   python -m pytest --cov=downloader --cov=uploader --cov=gitignore --cov=settings --cov=main --cov-report=term-missing
+   python -m pytest --cov=downloader --cov=uploader --cov=gitignore --cov=settings --cov=main --cov=pack_upload --cov=version_stamp --cov=run_selected_transfers --cov=monitor --cov-report=term-missing
    ```
 4. 若想要更方便瀏覽的 HTML 覆蓋率報告：
    ```
-   python -m pytest --cov=downloader --cov=uploader --cov=gitignore --cov=settings --cov=main --cov-report=html
+   python -m pytest --cov=downloader --cov=uploader --cov=gitignore --cov=settings --cov=main --cov=pack_upload --cov=version_stamp --cov=run_selected_transfers --cov=monitor --cov-report=html
    ```
    產生的報告在 `htmlcov/index.html`，用瀏覽器開啟即可依檔案、行數檢視覆蓋狀況。
 
