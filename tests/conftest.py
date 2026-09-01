@@ -102,6 +102,7 @@ class FakeSFTPClient:
         self.dirs = set()
         self.mkdir_calls = []
         self.chmod_calls = []   # 記錄 (path, mode),供保留權限相關測試檢查
+        self.truncate_calls = []  # 記錄 (path, size),供續傳切回檢查點的測試檢查
         self.utime_calls = []   # 記錄 (path, (atime, mtime))
 
     def stat(self, path):
@@ -142,6 +143,15 @@ class FakeSFTPClient:
             data = f.read()
         self.files[remote_path] = data
         self.put_calls.append((local_path, remote_path))
+
+    def truncate(self, path, size):
+        """對應 paramiko.SFTPClient.truncate：把遠端檔案裁到指定長度（續傳切回檢查點用）。"""
+        path = path.rstrip("/")
+        if path not in self.files:
+            raise FileNotFoundError(f"No such file: {path}")
+        self.truncate_calls.append((path, size))
+        data = self.files[path]
+        self.files[path] = data[:size] + b"\0" * max(0, size - len(data))
 
     def chmod(self, path, mode):
         self.chmod_calls.append((path.rstrip("/"), mode))

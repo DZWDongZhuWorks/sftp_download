@@ -787,12 +787,62 @@ class TestDownloadOneFileLocalSmallerOverwriteMode:
         assert "checkpoint_bytes=10" in message
         assert 'action="restart"' in message
 
-    def test_checkpoint_offset_mismatch_reports_both_sizes(
+    def test_partial_longer_than_checkpoint_truncates_back_and_resumes(
         self, downloader_factory, fake_sftp_factory, tmp_path, caplog
     ):
-        full_content = b"O" * 30
+        """暫存檔比檢查點長（行程被硬砍的正常結果）→ 切回檢查點續傳，不整份重下。"""
+        full_content = b"".join(bytes([i]) * 10 for i in range(3))  # 30 bytes
         part_size = 10
         checkpoint_bytes = 8
+        (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(full_content[:part_size])
+        d = downloader_factory(duplicate_mode="overwrite")
+        d._manifest = {
+            "f.bin": {
+                "size": len(full_content),
+                "mtime": 1000,
+                "local_sha256": hashlib.sha256(full_content[:checkpoint_bytes]).hexdigest(),
+                "local_bytes": checkpoint_bytes,
+            }
+        }
+        sftp = fake_sftp_factory(files={"/remote/f.bin": full_content}, mtimes={"/remote/f.bin": 1000})
+        read_sizes = []
+        original_open = sftp.open
+
+        def tracking_open(path, mode="rb"):
+            fake_file = original_open(path, mode)
+            original_read = fake_file.read
+
+            def tracked_read(n=-1):
+                chunk = original_read(n)
+                read_sizes.append(len(chunk))
+                return chunk
+
+            fake_file.read = tracked_read
+            return fake_file
+
+        sftp.open = tracking_open
+        d.sftp = sftp
+
+        with caplog.at_level(logging.INFO):
+            result = d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        assert result == "downloaded"
+        assert (tmp_path / "f.bin").read_bytes() == full_content
+        assert not any("[RESUME_REJECTED]" in r.message for r in caplog.records)
+        message = next(r.message for r in caplog.records if "[RESUME_ACCEPTED]" in r.message)
+        assert f"resume_offset={checkpoint_bytes}" in message
+        assert f"discarded_bytes={part_size - checkpoint_bytes}" in message
+        assert 'action="truncate_and_append"' in message
+        # 只補剩下的 22 bytes；被丟掉的只有未經驗證的 2 bytes，不是整份 30 bytes。
+        assert sum(read_sizes) == len(full_content) - checkpoint_bytes
+
+    def test_checkpoint_ahead_of_partial_reports_offset_mismatch(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """反向落差（暫存檔比檢查點短）沒有任何可驗證的內容 → 仍然整份重下。"""
+        full_content = b"O" * 30
+        part_size = 8
+        checkpoint_bytes = 10
         (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(full_content[:part_size])
         d = downloader_factory(duplicate_mode="overwrite")
         d._manifest = {
@@ -814,6 +864,58 @@ class TestDownloadOneFileLocalSmallerOverwriteMode:
         assert 'reason="checkpoint_offset_mismatch"' in message
         assert f"partial_bytes={part_size}" in message
         assert f"checkpoint_bytes={checkpoint_bytes}" in message
+
+    def test_truncate_failure_falls_back_to_full_redownload(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog, monkeypatch
+    ):
+        """切不動暫存檔（權限/檔案系統問題）時退回整份重下，並留下可診斷的原因。"""
+        full_content = b"T" * 30
+        (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(full_content[:10])
+        d = downloader_factory(duplicate_mode="overwrite")
+        d._manifest = {
+            "f.bin": {
+                "size": len(full_content),
+                "mtime": 1000,
+                "local_sha256": hashlib.sha256(full_content[:8]).hexdigest(),
+                "local_bytes": 8,
+            }
+        }
+        d.sftp = fake_sftp_factory(files={"/remote/f.bin": full_content}, mtimes={"/remote/f.bin": 1000})
+        monkeypatch.setattr(dl.os, "truncate", MagicMock(side_effect=OSError("read-only fs")))
+
+        with caplog.at_level(logging.WARNING):
+            result = d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        assert result == "downloaded"
+        assert (tmp_path / "f.bin").read_bytes() == full_content
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="partial_truncate_failed"' in message
+        assert "read-only fs" in message
+
+    def test_corrupt_checkpoint_offset_is_treated_as_missing(
+        self, downloader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """manifest 被寫壞（local_bytes 不是數字）時整份重下，而不是炸在型別比較上。"""
+        full_content = b"C" * 30
+        (tmp_path / ("f.bin" + dl.PART_SUFFIX)).write_bytes(full_content[:10])
+        d = downloader_factory(duplicate_mode="overwrite")
+        d._manifest = {
+            "f.bin": {
+                "size": len(full_content),
+                "mtime": 1000,
+                "local_sha256": hashlib.sha256(full_content[:10]).hexdigest(),
+                "local_bytes": None,  # 寫到一半斷電/被手改
+            }
+        }
+        d.sftp = fake_sftp_factory(files={"/remote/f.bin": full_content}, mtimes={"/remote/f.bin": 1000})
+
+        with caplog.at_level(logging.WARNING):
+            result = d._download_one_file("/remote/f.bin", "f.bin", tmp_path)
+
+        assert result == "downloaded"
+        assert (tmp_path / "f.bin").read_bytes() == full_content
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="checkpoint_offset_missing"' in message
 
     def test_remote_version_changed_falls_back_to_full_redownload(self, downloader_factory, fake_sftp_factory, tmp_path):
         """就算本地雜湊本身沒問題，只要遠端版本（size/mtime）跟紀錄不符，就不能信任接續。"""
@@ -890,6 +992,57 @@ class TestDownloadOneFileCheckpointing:
         manifest = d._load_manifest(tmp_path)
         assert manifest["big.bin"]["local_bytes"] == len(content)
         assert manifest["big.bin"]["local_sha256"] == hashlib.sha256(content).hexdigest()
+
+    def test_slow_transfer_checkpoints_by_elapsed_time_not_percentage(
+        self, downloader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        """慢鏈路的大檔在跨過 10% 之前就必須留下檢查點。
+
+        真實案例（船上 shipboard_alert）：1.2 GB 的包裹在 5～20 KB/s 的鏈路上、每輪只有
+        25 分鐘的時間窗，一輪只傳得動約 2%。舊版「每 10% 存一次」永遠碰不到第一個門檻，
+        行程被 SIGKILL 後 manifest 一片空白，於是每小時都從 byte 0 重傳一次。
+        """
+        content = b"S" * (dl.CHUNK_SIZE * 15)
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_BYTES", 1 << 30)  # 位元組門檻遠遠碰不到
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_SECONDS", 0)      # 一律由時間門檻觸發
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/big.bin": content}, mtimes={"/remote/big.bin": 42})
+        snapshots = self._record_checkpoints(d, "big.bin")
+
+        d._download_one_file("/remote/big.bin", "big.bin", tmp_path)
+
+        # 第一個檢查點落在 1/15 ≈ 6.7%，遠在舊版的 10% 門檻之前
+        assert snapshots[0] == dl.CHUNK_SIZE
+        assert snapshots[0] < len(content) // 10
+
+    def test_checkpoint_offset_is_capped_by_transferred_bytes(
+        self, downloader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        """位元組門檻：不論時間過多久，每累積固定量就落盤一次，丟失量因此有上限。"""
+        content = b"B" * (dl.CHUNK_SIZE * 15)
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_BYTES", dl.CHUNK_SIZE * 4)
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_SECONDS", 3600)  # 時間門檻不會觸發
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/big.bin": content}, mtimes={"/remote/big.bin": 42})
+        snapshots = self._record_checkpoints(d, "big.bin")
+
+        d._download_one_file("/remote/big.bin", "big.bin", tmp_path)
+
+        # 傳輸中每 4 個 chunk 一次，最後一筆是 finally 的收尾（15 個 chunk 全部）
+        assert snapshots == [dl.CHUNK_SIZE * n for n in (4, 8, 12, 15)]
+
+    @staticmethod
+    def _record_checkpoints(downloader, rel_path):
+        """記下每次落盤當下 manifest 記的 offset，供檢查點節奏的斷言使用。"""
+        snapshots = []
+        original_save = downloader._save_manifest
+
+        def recording_save(local_root):
+            snapshots.append(downloader._manifest[rel_path]["local_bytes"])
+            return original_save(local_root)
+
+        downloader._save_manifest = recording_save
+        return snapshots
 
     def test_interrupted_transfer_still_checkpoints_partial_progress(self, downloader_factory, fake_sftp_factory, tmp_path):
         """下載中途丟例外時，finally 仍要存下已寫入的進度，讓下次重試能安全接續。"""

@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import downloader as dl  # noqa: E402  （檢查點節奏常數與共用基底都住在這裡）
 import uploader as up  # noqa: E402
 
 
@@ -308,9 +309,93 @@ class TestUploadOneFileResume:
         assert 'actual_hash_prefix=' in message
         assert 'action="overwrite"' in message
 
+    def test_remote_longer_than_checkpoint_truncates_back_and_resumes(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """遠端比檢查點長（行程被硬砍的正常結果）→ 切回檢查點續傳，不整份覆蓋重傳。
+
+        船上實際發生的狀況：checkpoint 停在 2,129,920，遠端已經有 20～37 MB，舊版判成
+        checkpoint_offset_mismatch 後從 byte 0 覆蓋，1.2 GB 的包裹因此每小時砍掉重練一次。
+        """
+        content = b"".join(bytes([i % 251]) * up.CHUNK_SIZE for i in range(4))
+        checkpoint_bytes = up.CHUNK_SIZE
+        remote_size = up.CHUNK_SIZE * 3  # 上一趟被 SIGKILL 前已經送達、但沒記進 manifest
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        sftp = fake_sftp_factory(files={"/remote/big.bin": content[:remote_size]})
+        writes = []
+        original_open = sftp.open
+
+        def tracking_open(path, mode="rb"):
+            fake_file = original_open(path, mode)
+            original_write = fake_file.write
+
+            def tracked_write(data):
+                writes.append(len(data))
+                return original_write(data)
+
+            fake_file.write = tracked_write
+            return fake_file
+
+        sftp.open = tracking_open
+        d.sftp = sftp
+        d._manifest = {
+            "big.bin": {
+                "size": len(content),
+                "mtime": _mtime(local),
+                "local_sha256": hashlib.sha256(content[:checkpoint_bytes]).hexdigest(),
+                "local_bytes": checkpoint_bytes,
+            }
+        }
+
+        with caplog.at_level(logging.INFO):
+            result = d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        assert result == "uploaded"
+        assert d.sftp.files["/remote/big.bin"] == content
+        assert not any("[RESUME_REJECTED]" in r.message for r in caplog.records)
+        assert sftp.truncate_calls == [("/remote/big.bin", checkpoint_bytes)]
+        message = next(r.message for r in caplog.records if "[RESUME_ACCEPTED]" in r.message)
+        assert f"resume_offset={checkpoint_bytes}" in message
+        assert f"discarded_bytes={remote_size - checkpoint_bytes}" in message
+        assert 'action="truncate_and_append"' in message
+        # 只補剩下的 3 個 chunk：丟掉的是未經驗證的 2 個 chunk，不是整份 4 個
+        assert sum(writes) == len(content) - checkpoint_bytes
+
+    def test_remote_truncate_failure_falls_back_to_full_overwrite(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """伺服器切不動遠端檔案時退回整份覆蓋（舊行為），並留下可診斷的原因。"""
+        content = b"F" * (up.CHUNK_SIZE * 3)
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/big.bin": content[:up.CHUNK_SIZE * 2]})
+        d.sftp.truncate = MagicMock(side_effect=IOError("SETSTAT unsupported"))
+        d._manifest = {
+            "big.bin": {
+                "size": len(content),
+                "mtime": _mtime(local),
+                "local_sha256": hashlib.sha256(content[:up.CHUNK_SIZE]).hexdigest(),
+                "local_bytes": up.CHUNK_SIZE,
+            }
+        }
+
+        with caplog.at_level(logging.WARNING):
+            result = d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        assert result == "uploaded"
+        assert d.sftp.files["/remote/big.bin"] == content
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="remote_truncate_failed"' in message
+        assert "SETSTAT unsupported" in message
+        assert 'action="overwrite"' in message
+
     def test_offset_mismatch_reports_both_remote_and_checkpoint_sizes(
         self, uploader_factory, fake_sftp_factory, tmp_path, caplog
     ):
+        """反向落差（遠端比檢查點短）沒有任何可驗證的內容 → 仍然整份重傳。"""
         content = b"R" * (up.CHUNK_SIZE * 3)
         remote_size = up.CHUNK_SIZE
         checkpoint_bytes = up.CHUNK_SIZE * 2
@@ -336,6 +421,32 @@ class TestUploadOneFileResume:
         assert 'reason="checkpoint_offset_mismatch"' in message
         assert f"remote_size={remote_size}" in message
         assert f"checkpoint_bytes={checkpoint_bytes}" in message
+
+    def test_corrupt_checkpoint_offset_is_treated_as_missing(
+        self, uploader_factory, fake_sftp_factory, tmp_path, caplog
+    ):
+        """manifest 被寫壞（local_bytes 不是數字）時整份重傳，而不是炸在型別比較上。"""
+        content = b"C" * (up.CHUNK_SIZE * 2)
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/big.bin": content[:up.CHUNK_SIZE]})
+        d._manifest = {
+            "big.bin": {
+                "size": len(content),
+                "mtime": _mtime(local),
+                "local_sha256": hashlib.sha256(content[:up.CHUNK_SIZE]).hexdigest(),
+                "local_bytes": "32768",  # 字串，不是整數
+            }
+        }
+
+        with caplog.at_level(logging.WARNING):
+            result = d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        assert result == "uploaded"
+        assert d.sftp.files["/remote/big.bin"] == content
+        message = next(r.message for r in caplog.records if "[RESUME_REJECTED]" in r.message)
+        assert 'reason="checkpoint_offset_missing"' in message
 
     def test_missing_checkpoint_hash_has_its_own_reason(
         self, uploader_factory, fake_sftp_factory, tmp_path, caplog
@@ -375,6 +486,57 @@ class TestUploadOneFileCheckpointing:
         manifest = d._load_manifest(tmp_path)
         assert manifest["big.bin"]["local_bytes"] == len(content)
         assert manifest["big.bin"]["local_sha256"] == hashlib.sha256(content).hexdigest()
+
+    def test_slow_transfer_checkpoints_by_elapsed_time_not_percentage(
+        self, uploader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        """慢鏈路的大檔在跨過 10% 之前就必須留下檢查點（理由見 downloader 端同名測試）。"""
+        content = b"S" * (up.CHUNK_SIZE * 15)
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_BYTES", 1 << 30)  # 位元組門檻遠遠碰不到
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_SECONDS", 0)      # 一律由時間門檻觸發
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={})
+        snapshots = self._record_checkpoints(d, "big.bin", "/remote/big.bin")
+
+        d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        # 第一個檢查點落在 1/15 ≈ 6.7%，遠在舊版的 10% 門檻之前
+        assert snapshots[0] == (up.CHUNK_SIZE, up.CHUNK_SIZE)
+        assert snapshots[0][0] < len(content) // 10
+
+    def test_checkpoint_offset_is_capped_by_transferred_bytes(
+        self, uploader_factory, fake_sftp_factory, tmp_path, monkeypatch
+    ):
+        """位元組門檻：每累積固定量就落盤一次，而且記下的 offset 與遠端實際長度一致。"""
+        content = b"B" * (up.CHUNK_SIZE * 15)
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_BYTES", up.CHUNK_SIZE * 4)
+        monkeypatch.setattr(dl, "CHECKPOINT_INTERVAL_SECONDS", 3600)  # 時間門檻不會觸發
+        local = tmp_path / "big.bin"
+        _write(local, content)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={})
+        snapshots = self._record_checkpoints(d, "big.bin", "/remote/big.bin")
+
+        d._upload_one_file(local, "big.bin", "/remote", tmp_path)
+
+        # 傳輸中每 4 個 chunk 一次，最後一筆是 finally 的收尾（15 個 chunk 全部）；
+        # 每一筆的 manifest offset 都必須等於遠端當下的長度，否則下一輪無法安全接續。
+        assert snapshots == [(up.CHUNK_SIZE * n, up.CHUNK_SIZE * n) for n in (4, 8, 12, 15)]
+
+    @staticmethod
+    def _record_checkpoints(uploader, rel_path, remote_path):
+        """記下每次落盤當下的 (manifest offset, 遠端實際長度)，供檢查點節奏的斷言使用。"""
+        snapshots = []
+        original_save = uploader._save_manifest
+
+        def recording_save(local_root):
+            snapshots.append((uploader._manifest[rel_path]["local_bytes"], len(uploader.sftp.files[remote_path])))
+            return original_save(local_root)
+
+        uploader._save_manifest = recording_save
+        return snapshots
 
     def test_transfer_error_logs_saved_checkpoint_context(
         self, uploader_factory, fake_sftp_factory, tmp_path, caplog
