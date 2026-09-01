@@ -664,6 +664,66 @@ class TestDownloadOneFileResumeDisabled:
         assert (tmp_path / "f_copy.json").read_bytes() == b"NEW-DATA"
 
 
+class TestSkipAlignsLocalMode:
+    """對稱於 uploader 的權限對齊:內容未變更時只補權限、不重傳。"""
+
+    def test_same_content_different_mode_chmods_without_downloading(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        local = tmp_path / "run.sh"
+        local.write_bytes(b"#!/bin/sh\n")
+        os.chmod(local, 0o644)
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/run.sh": b"#!/bin/sh\n"},
+                                   mtimes={"/remote/run.sh": 7000},
+                                   modes={"/remote/run.sh": 0o755})
+
+        assert d._download_one_file("/remote/run.sh", "run.sh", tmp_path) == "skipped"
+        assert stat.S_IMODE(local.stat().st_mode) == 0o755
+        assert local.read_bytes() == b"#!/bin/sh\n"     # 內容沒被重寫
+
+    def test_matching_mode_leaves_local_untouched(self, downloader_factory, fake_sftp_factory, tmp_path):
+        local = tmp_path / "a.txt"
+        local.write_bytes(b"aaa")
+        os.chmod(local, 0o644)
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"aaa"}, mtimes={"/remote/a.txt": 1},
+                                   modes={"/remote/a.txt": 0o644})
+
+        assert d._download_one_file("/remote/a.txt", "a.txt", tmp_path) == "skipped"
+        assert stat.S_IMODE(local.stat().st_mode) == 0o644
+
+    def test_remote_without_mode_is_left_alone(self, downloader_factory, fake_sftp_factory, tmp_path):
+        # 伺服器省略 mode 時不能拿來判斷:本地權限保持原樣、不得炸掉傳輸。
+        local = tmp_path / "a.txt"
+        local.write_bytes(b"aaa")
+        os.chmod(local, 0o600)
+        d = downloader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"aaa"}, mtimes={"/remote/a.txt": 1})
+        listed = FakeSFTPAttr("a.txt", is_dir=False, size=3, mtime=1)
+        listed.st_mode = None
+        d.sftp.stat = MagicMock(return_value=listed)
+
+        assert d._download_one_file("/remote/a.txt", "a.txt", tmp_path) == "skipped"
+        assert stat.S_IMODE(local.stat().st_mode) == 0o600
+
+    def test_alignment_uses_the_listed_attribute_without_extra_stat(
+        self, downloader_factory, fake_sftp_factory, tmp_path
+    ):
+        # 偵測必須是零額外往返:略過分支不該為了 mode 再打一次 stat。
+        local = tmp_path / "run.sh"
+        local.write_bytes(b"12345")
+        os.chmod(local, 0o644)
+        d = downloader_factory()
+        sftp = fake_sftp_factory(files={"/remote/run.sh": b"12345"}, mtimes={"/remote/run.sh": 4})
+        d.sftp = sftp
+        sftp.stat = MagicMock(side_effect=AssertionError("略過判斷不該再 stat"))
+        listed = FakeSFTPAttr("run.sh", is_dir=False, size=5, mtime=4, mode=0o755)
+
+        assert d._download_one_file("/remote/run.sh", "run.sh", tmp_path, listed) == "skipped"
+        assert stat.S_IMODE(local.stat().st_mode) == 0o755
+
+
 class TestDownloadOneFileSameSize:
     def test_no_manifest_entry_and_same_size_skips_and_bootstraps_manifest(self, downloader_factory, fake_sftp_factory, tmp_path):
         (tmp_path / "legacy.bin").write_bytes(b"SAMESIZE12")

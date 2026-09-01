@@ -187,6 +187,7 @@ cp example_settings.json settings.json
 - `recursive`、`ignore_file`、`resume`、`duplicate_mode`、`duplicate_suffix`、`retry_*`、`auto_reconnect`、`wait_for_network` 等設定的意義與下載完全相同。
 - **遠端同名檔案處理**沿用 `duplicate_mode`：`overwrite`（**預設**，直接覆蓋遠端舊檔）或 `duplicate`（在遠端以 `_copy` 後綴另存新檔、保留舊檔）。
 - **跳過未變更**：以本地檔案的 size/mtime 搭配版本紀錄判斷，遠端已存在且未變更的檔案會略過不重傳。
+- **權限對齊（不重傳）**：略過的檔案若兩端 mode 不同，只補一次 `chmod`、不動內容，log 記為 `[MODE_ALIGNED]`。偵測不花任何額外往返（判定所需的兩份 stat 本來就已取得），只有真的不一致時才付一次 `chmod` 的來回，收斂後就是零。**發布端是權限的唯一真相**，在目的地手動改的權限會在下一趟被改回來。伺服器沒回報 mode 時（SFTP 協定允許省略）當作沒這回事，不做任何調整。下載方向對稱。
 - **斷點續傳**：遠端檔案若比本地小且版本紀錄相符，會驗證本地前綴內容雜湊後從遠端已上傳的位置接續上傳（與下載對稱，驗證只讀本機磁碟、不回讀遠端內容）。
 - **版本紀錄檔**：上傳使用 `.sftp_upload_manifest.json`（存放在本地來源目錄），與下載的 `.sftp_download_manifest.json` 分開，同一目錄雙向使用不會互相覆蓋；走訪來源上傳時會自動排除這兩個 manifest 檔本身。
 
@@ -436,6 +437,7 @@ SFTP 連線，並把 `.part` 的**精確位元組數、SHA-256、遠端 size/mti
 | `RESUME_ACCEPTED` | 續傳驗證通過；包含 offset、總大小、剩餘位元組數，以及為了切回檢查點而捨棄的 `discarded_bytes` |
 | `RESUME_REJECTED` | 續傳被拒絕；包含精確原因、雙方大小、checkpoint offset 與 hash 是否存在 |
 | `CHECKPOINT_SAVED` | 取消或傳輸錯誤後保存的進度、signal、offset 與 manifest 寫入結果 |
+| `MODE_ALIGNED` | 內容未變更、但兩端 mode 不同，已只補權限不重傳；含 `old_mode` / `new_mode`（八進位字串） |
 | `LIST_RETRY` / `TRANSFER_RETRY` / `TRANSFER_ERROR` | 清單、單檔傳輸的階段、重試資訊、例外及最終動作 |
 | `LOG_UPLOAD_ATTEMPT` / `LOG_UPLOAD_RETRY` | 回傳 Log 的目的地，以及 `reused_connection`（是否沿用傳輸階段的連線，見下方【連線次數】）；沿用的連線失效時會出現 `LOG_UPLOAD_RETRY` 並重連一次 |
 
