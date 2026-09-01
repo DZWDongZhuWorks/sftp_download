@@ -32,3 +32,10 @@ fleet_logs/
 # 版本標記:上傳前由 version_stamp.py 產生的「產物」,不進 git(對外版號的宣告是
 # VERSION.json,那個要人工編輯、要進 git)。它會隨鏡像上船,這正是預期行為。
 /VERSION.stamp.json
+
+# AI 工具的本機工作目錄。.claude/ 底下會有 worktrees/(整份 repo 副本),
+# 一旦沒忽略就會以 "?? .claude/" 出現在 git status —— 在待傳輸專案裡,
+# 那等同讓 version_stamp.py 把該次發布記成 dirty: true。
+.claude/
+.agents/
+.codex/
