@@ -97,6 +97,16 @@ def checkpoint_offset(known):
     return None
 
 
+def permission_bits(file_stat):
+    """取出權限位元(不含格式位元);取不到 mode 時回 None。
+
+    SFTP 協定允許伺服器省略 mode(見 SFTPDownloader._resolve_remote_attr),而權限同步是
+    「有就對齊、沒有就當沒這回事」的加值行為 —— 絕不能因為對面不報 mode 就讓傳輸炸掉。
+    """
+    mode = getattr(file_stat, "st_mode", None)
+    return stat.S_IMODE(mode) if mode is not None else None
+
+
 def diagnostic_message(event, summary, **fields):
     """建立可供人閱讀、也可被程式穩定解析的診斷訊息。
 
@@ -742,6 +752,37 @@ class SFTPDownloader(SFTPBase):
                 return listed_attr
         return self.sftp.stat(remote_file)
 
+    def _align_local_mode(self, local_file, remote_stat, rel_path):
+        """內容未變更、但本地權限與遠端不同時,只補權限、不重傳。
+
+        為什麼要有這條路:略過分支是常態,而傳完才套用的 os.chmod(見本方法下方的下載收尾)
+        因此永遠不會執行 —— 權限一旦漂移(或是在「保留權限」功能上線前就上船的檔案)就再也
+        不會自己收斂,除非有人讓整個檔重傳。判定所需的兩份 stat 都已經在手上,所以偵測是
+        零額外往返;只有真的不一致時才付一次 chmod。
+        """
+        desired = permission_bits(remote_stat)
+        if desired is None:             # 伺服器沒帶 mode:當沒這回事
+            return
+        try:
+            current = stat.S_IMODE(local_file.stat().st_mode)
+        except OSError:
+            return
+        if current == desired:
+            return
+        try:
+            os.chmod(str(local_file), desired)
+        except OSError as error:
+            self.logger.warning(f"對齊 {rel_path} 權限失敗(內容未受影響): {error}")
+            return
+        self.logger.info(diagnostic_message(
+            "MODE_ALIGNED",
+            f"權限已對齊(未重傳): {rel_path}",
+            direction="download",
+            file=rel_path,
+            old_mode="%04o" % current,
+            new_mode="%04o" % desired,
+        ))
+
     def _download_one_file(self, remote_file, rel_path, local_root, listed_attr=None):
         local_file = local_root / Path(*rel_path.split("/"))
         local_file.parent.mkdir(parents=True, exist_ok=True)
@@ -772,6 +813,7 @@ class SFTPDownloader(SFTPBase):
                     # 這裡不逐一雜湊比對整個檔案內容，避免每次執行都要重新讀取所有已下載完成的檔案。
                     if known is None or (known.get("size") == remote_size and known.get("mtime") == remote_mtime):
                         self.logger.info(f"略過（已完整下載）: {rel_path}")
+                        self._align_local_mode(local_file, remote_stat, rel_path)
                         self._manifest[rel_path] = {"size": remote_size, "mtime": remote_mtime}
                         self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
                         return "skipped"

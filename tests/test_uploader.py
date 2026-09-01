@@ -179,6 +179,84 @@ class TestUploadPreservesModeAndMtime:
         assert any(p == "/remote/x.sh" and int(times[1]) == 2222 for p, times in d.sftp.utime_calls)
 
 
+class TestSkipAlignsRemoteMode:
+    """內容未變更時只補權限、不重傳。
+
+    傳完才套用的 chmod 在略過分支永遠不會執行,所以權限漂移(或「保留權限」功能上線前
+    就上船的檔案)過去永遠不會收斂 —— 船上 .sh 掉 +x 就是這麼發生的。
+    """
+
+    def test_same_content_different_mode_chmods_without_transferring(
+        self, uploader_factory, fake_sftp_factory, tmp_path
+    ):
+        local = tmp_path / "run.sh"
+        _write(local, b"#!/bin/sh\n")
+        os.chmod(local, 0o755)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/run.sh": b"#!/bin/sh\n"},
+                                   modes={"/remote/run.sh": 0o644})
+
+        assert d._upload_one_file(local, "run.sh", "/remote", tmp_path) == "skipped"
+        assert ("/remote/run.sh", 0o755) in d.sftp.chmod_calls
+        assert d.sftp.put_calls == []           # 一個位元組都沒重傳
+        assert d.sftp.files["/remote/run.sh"] == b"#!/bin/sh\n"
+
+    def test_second_run_is_quiet_once_mode_converged(
+        self, uploader_factory, fake_sftp_factory, tmp_path
+    ):
+        local = tmp_path / "run.sh"
+        _write(local, b"#!/bin/sh\n")
+        os.chmod(local, 0o755)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/run.sh": b"#!/bin/sh\n"},
+                                   modes={"/remote/run.sh": 0o644})
+        d._upload_one_file(local, "run.sh", "/remote", tmp_path)
+        d.sftp.chmod_calls.clear()
+
+        assert d._upload_one_file(local, "run.sh", "/remote", tmp_path) == "skipped"
+        assert d.sftp.chmod_calls == []         # 已對齊:不再付那一次來回
+
+    def test_matching_mode_never_calls_chmod(self, uploader_factory, fake_sftp_factory, tmp_path):
+        local = tmp_path / "a.txt"
+        _write(local, b"aaa")
+        os.chmod(local, 0o644)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"aaa"}, modes={"/remote/a.txt": 0o644})
+
+        assert d._upload_one_file(local, "a.txt", "/remote", tmp_path) == "skipped"
+        assert d.sftp.chmod_calls == []
+
+    def test_remote_without_mode_is_left_alone(self, uploader_factory, fake_sftp_factory, tmp_path):
+        # SFTP 協定允許伺服器省略 mode:不能拿來判斷,更不能因此炸掉傳輸。
+        local = tmp_path / "a.txt"
+        _write(local, b"aaa")
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/a.txt": b"aaa"})
+        real_stat = d.sftp.stat
+
+        def stat_without_mode(path):
+            attr = real_stat(path)
+            attr.st_mode = None
+            return attr
+
+        d.sftp.stat = stat_without_mode
+        assert d._upload_one_file(local, "a.txt", "/remote", tmp_path) == "skipped"
+        assert d.sftp.chmod_calls == []
+
+    def test_chmod_failure_does_not_fail_the_skip(self, uploader_factory, fake_sftp_factory, tmp_path, caplog):
+        local = tmp_path / "run.sh"
+        _write(local, b"#!/bin/sh\n")
+        os.chmod(local, 0o755)
+        d = uploader_factory()
+        d.sftp = fake_sftp_factory(files={"/remote/run.sh": b"#!/bin/sh\n"},
+                                   modes={"/remote/run.sh": 0o644})
+        d.sftp.chmod = MagicMock(side_effect=IOError("permission denied"))
+
+        with caplog.at_level(logging.WARNING):
+            assert d._upload_one_file(local, "run.sh", "/remote", tmp_path) == "skipped"
+        assert any("權限失敗" in r.message for r in caplog.records)
+
+
 class TestUploadOneFileFresh:
     def test_fresh_upload_writes_remote_and_records_manifest(self, uploader_factory, fake_sftp_factory, tmp_path):
         content = b"hello world"

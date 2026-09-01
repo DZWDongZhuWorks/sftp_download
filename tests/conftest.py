@@ -32,10 +32,14 @@ def logger():
 class FakeSFTPAttr:
     """模擬 paramiko.SFTPAttributes。"""
 
-    def __init__(self, filename, is_dir, size=0, mtime=0, atime=None):
+    def __init__(self, filename, is_dir, size=0, mtime=0, atime=None, mode=None):
         self.filename = filename
         # 含權限位元(不只格式位元),讓 stat.S_IMODE 取得到真實權限(對應保留權限功能)。
-        self.st_mode = (stat_module.S_IFDIR | 0o755) if is_dir else (stat_module.S_IFREG | 0o644)
+        # mode=None 用預設值(檔 0644 / 目錄 0755);權限對齊的測試靠 FakeSFTPClient 的
+        # modes 指定個別檔案的權限。
+        if mode is None:
+            mode = 0o755 if is_dir else 0o644
+        self.st_mode = (stat_module.S_IFDIR if is_dir else stat_module.S_IFREG) | mode
         self.st_size = size
         self.st_mtime = mtime
         self.st_atime = atime if atime is not None else mtime
@@ -95,9 +99,10 @@ class FakeSFTPClient:
     """輕量假 SFTP client：用一個 {遠端路徑: bytes} 的字典模擬檔案樹，資料夾由路徑前綴自動推導。
     用於不需要真正連線的邏輯測試（列表、下載決策、版本比對等）。"""
 
-    def __init__(self, files=None, mtimes=None):
+    def __init__(self, files=None, mtimes=None, modes=None):
         self.files = dict(files or {})
         self.mtimes = dict(mtimes or {})
+        self.modes = dict(modes or {})   # {遠端路徑: 權限位元},未列出的檔用 FakeSFTPAttr 預設
         self.put_calls = []
         self.dirs = set()
         self.mkdir_calls = []
@@ -108,7 +113,8 @@ class FakeSFTPClient:
     def stat(self, path):
         path = path.rstrip("/")
         if path in self.files:
-            return FakeSFTPAttr(path, is_dir=False, size=len(self.files[path]), mtime=self.mtimes.get(path, 0))
+            return FakeSFTPAttr(path, is_dir=False, size=len(self.files[path]),
+                                mtime=self.mtimes.get(path, 0), mode=self.modes.get(path))
         prefix = path + "/"
         if path == "" or path in self.dirs or any(p.startswith(prefix) for p in self.files):
             return FakeSFTPAttr(path, is_dir=True)
@@ -132,7 +138,9 @@ class FakeSFTPClient:
                     seen_dirs.add(dirname)
                     results.append(FakeSFTPAttr(dirname, is_dir=True))
             else:
-                results.append(FakeSFTPAttr(rest, is_dir=False, size=len(data), mtime=self.mtimes.get(full_path, 0)))
+                results.append(FakeSFTPAttr(rest, is_dir=False, size=len(data),
+                                            mtime=self.mtimes.get(full_path, 0),
+                                            mode=self.modes.get(full_path)))
         return results
 
     def open(self, path, mode="rb"):
@@ -154,7 +162,9 @@ class FakeSFTPClient:
         self.files[path] = data[:size] + b"\0" * max(0, size - len(data))
 
     def chmod(self, path, mode):
-        self.chmod_calls.append((path.rstrip("/"), mode))
+        path = path.rstrip("/")
+        self.chmod_calls.append((path, mode))
+        self.modes[path] = mode         # 之後的 stat 要看得到新權限(權限對齊的收斂測試)
 
     def utime(self, path, times):
         self.utime_calls.append((path.rstrip("/"), times))
@@ -163,8 +173,8 @@ class FakeSFTPClient:
 @pytest.fixture
 def fake_sftp_factory():
     """回傳一個可建立 FakeSFTPClient 的工廠函式，讓測試自訂檔案樹內容。"""
-    def _make(files=None, mtimes=None):
-        return FakeSFTPClient(files=files, mtimes=mtimes)
+    def _make(files=None, mtimes=None, modes=None):
+        return FakeSFTPClient(files=files, mtimes=mtimes, modes=modes)
     return _make
 
 

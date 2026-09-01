@@ -23,6 +23,7 @@ from downloader import (
     diagnostic_message,
     format_exception,
     format_size,
+    permission_bits,
 )
 
 UPLOAD_MANIFEST_FILENAME = ".sftp_upload_manifest.json"
@@ -140,6 +141,32 @@ class SFTPUploader(SFTPBase):
             n += 1
         return candidate
 
+    def _align_remote_mode(self, remote_file, remote_stat, local_stat, rel_path):
+        """內容未變更、但遠端權限與本地不同時,只補權限、不重傳。
+
+        對稱於 SFTPDownloader._align_local_mode,理由也一樣:略過分支是常態,傳完才套用的
+        chmod(見 _upload_one_file 收尾)因此永遠不會執行,權限漂移永遠不會自己收斂 ——
+        船上 .sh 掉了 +x 就是這麼來的。偵測用的兩份 stat 都已在手上(零額外往返),只有真的
+        不一致時才付一次 chmod 的來回。發布端是權限的唯一真相(鏡像語意)。
+        """
+        desired = permission_bits(local_stat)
+        current = permission_bits(remote_stat)
+        if desired is None or current is None or current == desired:
+            return                      # 對面沒帶 mode 就當沒這回事
+        try:
+            self.sftp.chmod(remote_file, desired)
+        except (OSError, IOError) as error:
+            self.logger.warning(f"對齊遠端 {rel_path} 權限失敗(內容未受影響): {error}")
+            return
+        self.logger.info(diagnostic_message(
+            "MODE_ALIGNED",
+            f"權限已對齊(未重傳): {rel_path}",
+            direction="upload",
+            file=rel_path,
+            old_mode="%04o" % current,
+            new_mode="%04o" % desired,
+        ))
+
     def _upload_one_file(self, local_file, rel_path, remote_root, local_root):
         remote_file = remote_root.rstrip("/") + "/" + rel_path
         self._ensure_remote_dir(str(PurePosixPath(remote_file).parent))
@@ -189,6 +216,7 @@ class SFTPUploader(SFTPBase):
                         ))
                         self._manifest[rel_path] = {"size": local_size, "mtime": local_mtime}
                         self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
+                        self._align_remote_mode(remote_file, remote_stat, local_stat, rel_path)
                         return "skipped"
                     if self.duplicate_mode == "overwrite":
                         self.logger.info(diagnostic_message(
