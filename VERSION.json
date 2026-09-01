@@ -1,7 +1,7 @@
 {
-  "version": "0.10.3",
-  "date": "2026-08-31",
-  "notes": "README 校正：Python 下限改回 3.6、補上 config/script/monitor/deploy 與離線部署入口、測試涵蓋清單與 GUI 說明對齊實作",
+  "version": "0.10.4",
+  "date": "2026-09-01",
+  "notes": "斷點續傳修正：檢查點改為每 16 MB／60 秒（不再綁百分比），已傳輸端比檢查點長時切回檢查點續傳而非整份重傳",
   "stamp_exclude": [
     "*.whl"
   ]

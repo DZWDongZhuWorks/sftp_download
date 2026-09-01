@@ -23,6 +23,22 @@ from gitignore import GitIgnoreSpec
 CHUNK_SIZE = 32768
 SOCKET_TIMEOUT = 120
 KEEPALIVE_INTERVAL = 15
+# 檢查點節奏：傳輸中每累積這麼多位元組、或每經過這麼多秒（先到者為準）就把 offset 落盤一次。
+#
+# 【為什麼不是「每 10% 進度」】那個門檻會隨檔案大小一起放大，於是慢鏈路上的大檔永遠碰不到
+# 第一個門檻：實測 1.2 GB 的包裹在船岸 5～20 KB/s 的鏈路上，10%（約 120 MB）要連續傳 1.6
+# 小時才到得了，而排程給的時間窗只有 25 分鐘 —— 而且逾時是 SIGKILL，連傳輸迴圈 finally 的
+# 收尾都跑不到。結果是永遠寫不下任何檢查點、每趟都從 byte 0 重傳，遠端檔案每小時被砍掉重
+# 練一次，進度永久停在 0。改成位元組／秒數的絕對節奏後，多慢的鏈路都保證留下進度，代價也
+# 有上限。
+#
+# 兩個門檻的分工：硬中止時丟掉的進度是 min(位元組門檻, 當下速率 × 秒數門檻)。慢鏈路由秒數
+# 門檻把關（20 KB/s × 60 s ≈ 1.2 MB），快鏈路由位元組門檻把關（16 MB）。位元組門檻不取更小
+# 值的理由是寫入成本：manifest 是整份重寫的 JSON，最大的一份（岸端 fleet_logs 近 4,000 個
+# 項目）實測一次 32 ms，16 MB 一次代表每 GB 約 64 次、合計 2 秒上限，而多數目錄的 manifest
+# 只有幾個項目、單次不到 1 ms。
+CHECKPOINT_INTERVAL_BYTES = 16 * 1024 * 1024
+CHECKPOINT_INTERVAL_SECONDS = 60
 MANIFEST_FILENAME = ".sftp_download_manifest.json"
 # 下載一律先寫進「目的檔名 + 這個後綴」的暫存檔，完成後才 os.replace 換名到目的地。
 # 換名換的是 inode，於是：
@@ -66,6 +82,19 @@ def format_size(num_bytes):
 def format_exception(error):
     """保留例外類型與 repr；即使 socket.timeout 沒有訊息，Log 仍可辨識原因。"""
     return f"{type(error).__name__}: {error!r}"
+
+
+def checkpoint_offset(known):
+    """從 manifest entry 取出「已傳輸位元組數」；缺漏或型別/範圍不合理都回 None（視為沒有檢查點）。
+
+    manifest 是磁碟上的 JSON，可能被手改或寫到一半斷電。續傳判斷會把這個值拿去跟檔案大小
+    比大小，型別不設防的話一個字串就足以讓整趟傳輸炸在 TypeError 上，而正確的行為只是
+    「這個檢查點不可信、整份重傳」。bool 要另外擋掉：True 在 Python 裡是 int 的子類。
+    """
+    offset = known.get("local_bytes") if known else None
+    if isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0:
+        return offset
+    return None
 
 
 def diagnostic_message(event, summary, **fields):
@@ -493,6 +522,29 @@ class SFTPBase:
                 local_hash.update(chunk)
         return local_hash
 
+    def _hash_local_prefix(self, local_file, nbytes):
+        """計算本地檔案前 nbytes 位元組的 SHA-256（只讀本機磁碟），回傳 hashlib 雜湊物件，
+        用來驗證「已傳輸的前段」與本地內容是否相符後可直接沿用續傳。
+
+        兩個方向都用得到：上傳時驗證遠端已收到的前段、下載時驗證 .part 暫存檔的前段。"""
+        local_hash = hashlib.sha256()
+        remaining = nbytes
+        with open(local_file, "rb") as local_f:
+            while remaining > 0:
+                chunk = local_f.read(min(CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                local_hash.update(chunk)
+                remaining -= len(chunk)
+        return local_hash
+
+    def _checkpoint_due(self, transferred, last_bytes, last_time, now):
+        """傳輸迴圈是否該落盤一次檢查點（節奏定義與理由見 CHECKPOINT_INTERVAL_*）。"""
+        return (
+            transferred - last_bytes >= CHECKPOINT_INTERVAL_BYTES
+            or now - last_time >= CHECKPOINT_INTERVAL_SECONDS
+        )
+
     def _ensure_remote_dir(self, remote_dir):
         """從根目錄逐層確認/建立遠端目錄（等同 mkdir -p），已存在的層級略過。
 
@@ -751,45 +803,67 @@ class SFTPDownloader(SFTPBase):
         part_file = target_file.with_name(target_file.name + PART_SUFFIX)
         if self.resume and target_file == local_file and part_file.exists():
             part_size = part_file.stat().st_size
-            # 遠端版本要與紀錄一致，且紀錄的長度/雜湊要對得上暫存檔的現況，才敢接著往下寫。
+            # 遠端版本要與紀錄一致，且紀錄的雜湊要對得上暫存檔的前段，才敢接著往下寫。
+            # 能接續的位置一律是 checkpoint_bytes（唯一有雜湊可驗證的 offset）；暫存檔目前
+            # 長度只用來判斷該直接 append（相等）、先切回檢查點（更長）還是整份重下（更短）。
             # 每項條件分開判斷並留下穩定 reason code；舊訊息把所有原因混成「無法接續」，
             # 無法分辨是來源換版、checkpoint 落後、manifest 壞掉或真的內容被修改。
             reject_reason = None
             actual_hash = None
+            truncate_error = None
+            discarded = 0
+            checkpoint_bytes = checkpoint_offset(known)
             if known is None:
                 reject_reason = "checkpoint_missing"
             elif known.get("size") != remote_size:
                 reject_reason = "source_size_changed"
             elif known.get("mtime") != remote_mtime:
                 reject_reason = "source_mtime_changed"
-            elif "local_bytes" not in known:
+            elif checkpoint_bytes is None:
                 reject_reason = "checkpoint_offset_missing"
-            elif known.get("local_bytes") != part_size:
+            elif checkpoint_bytes > part_size:
+                # 暫存檔比檢查點短：檢查點聲稱驗證過的那一段已經不在磁碟上（暫存檔被截斷或
+                # 換過），沒有東西可以比對 → 整份重新下載。
                 reject_reason = "checkpoint_offset_mismatch"
             elif not known.get("local_sha256"):
                 reject_reason = "checkpoint_hash_missing"
-            elif part_size >= remote_size:
+            elif checkpoint_bytes >= remote_size:
                 reject_reason = "partial_not_smaller_than_source"
             else:
-                disk_hash = self._hash_local_file(part_file)
+                disk_hash = self._hash_local_prefix(part_file, checkpoint_bytes)
                 actual_hash = disk_hash.hexdigest()
-                if actual_hash == known["local_sha256"]:
-                    self.logger.info(diagnostic_message(
-                        "RESUME_ACCEPTED",
-                        f"本地端內容雜湊比對相符，接續下載: {rel_path}",
-                        direction="download",
-                        file=rel_path,
-                        source_size=remote_size,
-                        source_mtime=remote_mtime,
-                        resume_offset=part_size,
-                        remaining_bytes=remote_size - part_size,
-                        action="append",
-                    ))
-                    local_size = part_size
-                    running_hash = disk_hash  # 直接沿用，後續新下載的內容繼續累加上去
-                    mode = "ab"
-                else:
+                if actual_hash != known["local_sha256"]:
                     reject_reason = "checkpoint_hash_mismatch"
+                else:
+                    # 暫存檔比檢查點長 → 多出來的尾巴是上一趟被硬砍（SIGKILL／斷電）時已經
+                    # 寫進磁碟、卻來不及記進 manifest 的部分。它「很可能」就是同一份內容，但
+                    # 沒有任何雜湊能證明，所以不賭：切回已驗證的 checkpoint_bytes 再接續。
+                    # 丟掉的量有上限（CHECKPOINT_INTERVAL_BYTES），遠比整份重新下載便宜 ——
+                    # 舊版在這裡要求「暫存檔大小與檢查點精確相等」，於是硬砍留下的正常狀態被
+                    # 判成不可信，每趟都從 byte 0 重來，慢鏈路上的大檔永遠下載不完。
+                    discarded = part_size - checkpoint_bytes
+                    if discarded > 0:
+                        try:
+                            os.truncate(str(part_file), checkpoint_bytes)
+                        except OSError as e:
+                            reject_reason = "partial_truncate_failed"
+                            truncate_error = format_exception(e)
+                    if reject_reason is None:
+                        self.logger.info(diagnostic_message(
+                            "RESUME_ACCEPTED",
+                            f"本地端內容雜湊比對相符，接續下載: {rel_path}",
+                            direction="download",
+                            file=rel_path,
+                            source_size=remote_size,
+                            source_mtime=remote_mtime,
+                            resume_offset=checkpoint_bytes,
+                            remaining_bytes=remote_size - checkpoint_bytes,
+                            discarded_bytes=discarded,
+                            action="truncate_and_append" if discarded else "append",
+                        ))
+                        local_size = checkpoint_bytes
+                        running_hash = disk_hash  # 直接沿用，後續新下載的內容繼續累加上去
+                        mode = "ab"
             if mode == "wb":
                 # 暫存檔對不上紀錄（來源已換版、內容被動過或根本沒有檢查點）→ 不可信，
                 # 整份重新下載；"wb" 開檔即截斷，不必另外刪除。
@@ -809,13 +883,16 @@ class SFTPDownloader(SFTPBase):
                     expected_hash_prefix=str(known.get("local_sha256") or "")[:12] if known else None,
                     actual_hash_prefix=actual_hash[:12] if actual_hash else None,
                     action="restart",
+                    **({"error": truncate_error} if truncate_error else {}),
                 ))
 
         self.logger.info(f"開始下載: {rel_path} ({format_size(remote_size)})")
         last_pct_logged = -1
-        last_checkpoint_pct = -1
         transferred = local_size
         start_time = time.time()
+        # 上次落盤檢查點的位元組數與時間（節奏與理由見 CHECKPOINT_INTERVAL_*）。
+        last_checkpoint_bytes = transferred
+        last_checkpoint_time = start_time
         # 記住上次印進度的時間與位元組數，用差值算「這段期間的即時速率」，比整體平均更能反映當下網速。
         last_log_time = start_time
         last_log_bytes = transferred
@@ -846,9 +923,12 @@ class SFTPDownloader(SFTPBase):
                                 last_log_time = now
                                 last_log_bytes = transferred
                                 last_pct_logged = pct
-                            # 每跨過 10% 進度就存一次檢查點，而不是每個 chunk 都寫檔，
-                            # 避免大檔案下載時頻繁寫入版本紀錄檔造成不必要的效能負擔。
-                            if self.resume and pct >= last_checkpoint_pct + 10:
+                        # 存檢查點的節奏見 CHECKPOINT_INTERVAL_*：位元組或秒數任一到達就落盤，
+                        # 不跟著百分比走。flush() 把 Python 緩衝交給作業系統，之後行程即使被
+                        # SIGKILL，暫存檔內容與 manifest 記的 offset 仍然一致。
+                        if self.resume:
+                            now = time.time()
+                            if self._checkpoint_due(transferred, last_checkpoint_bytes, last_checkpoint_time, now):
                                 local_f.flush()
                                 self._manifest[rel_path] = {
                                     "size": remote_size,
@@ -857,7 +937,8 @@ class SFTPDownloader(SFTPBase):
                                     "local_bytes": transferred,
                                 }
                                 self._save_manifest(local_root)
-                                last_checkpoint_pct = pct
+                                last_checkpoint_bytes = transferred
+                                last_checkpoint_time = now
         except TransferCancelled as e:
             cancelled = e
             # Python signal 可能恰好落在 local_f.write() 已完成、running_hash / transferred

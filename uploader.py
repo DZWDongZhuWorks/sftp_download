@@ -19,6 +19,7 @@ from downloader import (
     PART_SUFFIX,
     SFTPBase,
     TransferCancelled,
+    checkpoint_offset,
     diagnostic_message,
     format_exception,
     format_size,
@@ -139,20 +140,6 @@ class SFTPUploader(SFTPBase):
             n += 1
         return candidate
 
-    def _hash_local_prefix(self, local_file, nbytes):
-        """計算本地檔案前 nbytes 位元組的 SHA-256（只讀本機磁碟），回傳 hashlib 雜湊物件，
-        用來驗證遠端已上傳的前段內容是否與本地相符後可直接沿用續傳。"""
-        local_hash = hashlib.sha256()
-        remaining = nbytes
-        with open(local_file, "rb") as local_f:
-            while remaining > 0:
-                chunk = local_f.read(min(CHUNK_SIZE, remaining))
-                if not chunk:
-                    break
-                local_hash.update(chunk)
-                remaining -= len(chunk)
-        return local_hash
-
     def _upload_one_file(self, local_file, rel_path, remote_root, local_root):
         remote_file = remote_root.rstrip("/") + "/" + rel_path
         self._ensure_remote_dir(str(PurePosixPath(remote_file).parent))
@@ -232,43 +219,69 @@ class SFTPUploader(SFTPBase):
                     self.logger.info(f"重新上傳，另存為: {PurePosixPath(target_remote).name}")
                 else:
                     # 遠端檔案比本地小：逐項驗證 checkpoint，並留下穩定 reason code。
-                    # 只讀本機前綴與 manifest，不回讀遠端內容；remote_size 的角色是確認
-                    # 遠端目前長度與最後一次已保存的 offset 精確一致。
+                    # 只讀本機前綴與 manifest，不回讀遠端內容 —— 能接續的位置一律是
+                    # checkpoint_bytes（唯一有雜湊可驗證的 offset）；遠端目前長度只用來判斷
+                    # 該直接 append（相等）、先把遠端切回檢查點（更長）、還是整份重傳（更短）。
                     reject_reason = None
                     actual_hash = None
+                    truncate_error = None
+                    discarded = 0
+                    checkpoint_bytes = checkpoint_offset(known)
                     if known is None:
                         reject_reason = "checkpoint_missing"
                     elif known.get("size") != local_size:
                         reject_reason = "local_size_changed"
                     elif known.get("mtime") != local_mtime:
                         reject_reason = "local_mtime_changed"
-                    elif "local_bytes" not in known:
+                    elif checkpoint_bytes is None:
                         reject_reason = "checkpoint_offset_missing"
-                    elif known.get("local_bytes") != remote_disk_size:
+                    elif checkpoint_bytes > remote_disk_size:
+                        # 遠端比檢查點短：檢查點聲稱驗證過的那一段內容已經不在遠端上（被截斷或
+                        # 換過檔案），沒有東西可以比對 → 整份重新上傳。
                         reject_reason = "checkpoint_offset_mismatch"
                     elif not known.get("local_sha256"):
                         reject_reason = "checkpoint_hash_missing"
                     else:
-                        prefix_hash = self._hash_local_prefix(local_file, remote_disk_size)
+                        prefix_hash = self._hash_local_prefix(local_file, checkpoint_bytes)
                         actual_hash = prefix_hash.hexdigest()
-                        if actual_hash == known["local_sha256"]:
-                            running_hash = prefix_hash  # 直接沿用，後續新上傳的內容繼續累加上去
-                            self.logger.info(diagnostic_message(
-                                "RESUME_ACCEPTED",
-                                f"檢查點驗證相符，接續上傳: {rel_path}",
-                                direction="upload",
-                                file=rel_path,
-                                local_size=local_size,
-                                local_mtime=local_mtime,
-                                remote_size=remote_disk_size,
-                                resume_offset=remote_disk_size,
-                                remaining_bytes=local_size - remote_disk_size,
-                                action="append",
-                            ))
-                            uploaded_bytes = remote_disk_size
-                            mode = "ab"
-                        else:
+                        if actual_hash != known["local_sha256"]:
                             reject_reason = "checkpoint_hash_mismatch"
+                        else:
+                            # 遠端比檢查點長 → 多出來的尾巴是上一趟被硬砍（SIGKILL／斷電）時
+                            # 已經寫進遠端、卻來不及記進 manifest 的部分。它「很可能」就是同一
+                            # 份內容，但沒有任何雜湊能證明（要證明就得把遠端那段回讀下來，在
+                            # 20 KB/s 的船岸鏈路上比重傳還貴），所以不賭：把遠端切回已驗證的
+                            # checkpoint_bytes 再接續。丟掉的量有上限（CHECKPOINT_INTERVAL_BYTES）。
+                            #
+                            # 舊版在這裡要求「遠端大小與檢查點精確相等」，於是硬砍後留下的正常
+                            # 狀態被判成不可信，每趟都從 byte 0 覆蓋重傳 —— 慢鏈路上的大檔因此
+                            # 永遠上傳不完（實測 1.2 GB 的包裹每小時被砍掉重練一次）。
+                            discarded = remote_disk_size - checkpoint_bytes
+                            if discarded > 0:
+                                try:
+                                    self.sftp.truncate(target_remote, checkpoint_bytes)
+                                except (OSError, paramiko.SSHException) as e:
+                                    # 伺服器不支援 SETSTAT/size 之類的情況：退回整份覆蓋，
+                                    # 語意與舊版相同，只是保留原因供診斷。
+                                    reject_reason = "remote_truncate_failed"
+                                    truncate_error = format_exception(e)
+                            if reject_reason is None:
+                                running_hash = prefix_hash  # 直接沿用，後續新上傳的內容繼續累加上去
+                                self.logger.info(diagnostic_message(
+                                    "RESUME_ACCEPTED",
+                                    f"檢查點驗證相符，接續上傳: {rel_path}",
+                                    direction="upload",
+                                    file=rel_path,
+                                    local_size=local_size,
+                                    local_mtime=local_mtime,
+                                    remote_size=remote_disk_size,
+                                    resume_offset=checkpoint_bytes,
+                                    remaining_bytes=local_size - checkpoint_bytes,
+                                    discarded_bytes=discarded,
+                                    action="truncate_and_append" if discarded else "append",
+                                ))
+                                uploaded_bytes = checkpoint_bytes
+                                mode = "ab"
 
                     if mode == "wb":
                         # 走到這裡 duplicate_mode 必定是 overwrite；安全檢查未通過就從頭覆蓋。
@@ -288,13 +301,16 @@ class SFTPUploader(SFTPBase):
                             expected_hash_prefix=str(known.get("local_sha256") or "")[:12] if known else None,
                             actual_hash_prefix=actual_hash[:12] if actual_hash else None,
                             action="overwrite",
+                            **({"error": truncate_error} if truncate_error else {}),
                         ))
 
         self.logger.info(f"開始上傳: {rel_path} ({format_size(local_size)})")
         last_pct_logged = -1
-        last_checkpoint_pct = -1
         transferred = uploaded_bytes
         start_time = time.time()
+        # 上次落盤檢查點的位元組數與時間（節奏與理由見 CHECKPOINT_INTERVAL_*）。
+        last_checkpoint_bytes = transferred
+        last_checkpoint_time = start_time
         # 記住上次印進度的時間與位元組數，用差值算「這段期間的即時速率」，比整體平均更能反映當下網速。
         last_log_time = start_time
         last_log_bytes = transferred
@@ -325,8 +341,13 @@ class SFTPUploader(SFTPBase):
                                 last_log_time = now
                                 last_log_bytes = transferred
                                 last_pct_logged = pct
-                            # 每跨過 10% 進度就存一次檢查點，避免大檔案上傳時頻繁寫入版本紀錄檔。
-                            if self.resume and pct >= last_checkpoint_pct + 10:
+                        # 存檢查點的節奏見 CHECKPOINT_INTERVAL_*：位元組或秒數任一到達就落盤，
+                        # 不跟著百分比走。flush() 之後遠端已收下這些位元組（未啟用 pipeline 的
+                        # SFTP 寫入是逐一等回應的），行程即使被 SIGKILL，manifest 記的 offset
+                        # 仍然對得上遠端實際長度。
+                        if self.resume:
+                            now = time.time()
+                            if self._checkpoint_due(transferred, last_checkpoint_bytes, last_checkpoint_time, now):
                                 remote_f.flush()
                                 self._manifest[rel_path] = {
                                     "size": local_size,
@@ -335,7 +356,8 @@ class SFTPUploader(SFTPBase):
                                     "local_bytes": transferred,
                                 }
                                 self._save_manifest(local_root)
-                                last_checkpoint_pct = pct
+                                last_checkpoint_bytes = transferred
+                                last_checkpoint_time = now
         except TransferCancelled as e:
             cancelled = e
             raise
