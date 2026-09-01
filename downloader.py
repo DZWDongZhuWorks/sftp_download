@@ -752,23 +752,19 @@ class SFTPDownloader(SFTPBase):
                 return listed_attr
         return self.sftp.stat(remote_file)
 
-    def _align_local_mode(self, local_file, remote_stat, rel_path):
+    def _align_local_mode(self, local_file, local_stat, remote_stat, rel_path):
         """內容未變更、但本地權限與遠端不同時,只補權限、不重傳。
 
         為什麼要有這條路:略過分支是常態,而傳完才套用的 os.chmod(見本方法下方的下載收尾)
         因此永遠不會執行 —— 權限一旦漂移(或是在「保留權限」功能上線前就上船的檔案)就再也
-        不會自己收斂,除非有人讓整個檔重傳。判定所需的兩份 stat 都已經在手上,所以偵測是
-        零額外往返;只有真的不一致時才付一次 chmod。
+        不會自己收斂,除非有人讓整個檔重傳。判定所需的兩份 stat 都已經在手上(遠端來自
+        _resolve_remote_attr、本地來自略過分支的大小比對),所以偵測是零額外往返、也零額外
+        syscall;只有真的不一致時才付一次 chmod。
         """
         desired = permission_bits(remote_stat)
-        if desired is None:             # 伺服器沒帶 mode:當沒這回事
-            return
-        try:
-            current = stat.S_IMODE(local_file.stat().st_mode)
-        except OSError:
-            return
-        if current == desired:
-            return
+        current = permission_bits(local_stat)   # 略過分支已取得的 stat,不再多打一次
+        if desired is None or current is None or current == desired:
+            return                      # 伺服器沒帶 mode:當沒這回事
         try:
             os.chmod(str(local_file), desired)
         except OSError as error:
@@ -806,14 +802,15 @@ class SFTPDownloader(SFTPBase):
                     target_file = self._next_duplicate_path(local_file)
                     self.logger.info(f"重新下載，另存為: {target_file.name}")
             else:
-                disk_size = local_file.stat().st_size
+                local_stat = local_file.stat()
+                disk_size = local_stat.st_size
 
                 if disk_size == remote_size:
                     # 大小相同：用版本紀錄（若有）判斷是否真的未變更；沒有紀錄則姑且視為未變更略過。
                     # 這裡不逐一雜湊比對整個檔案內容，避免每次執行都要重新讀取所有已下載完成的檔案。
                     if known is None or (known.get("size") == remote_size and known.get("mtime") == remote_mtime):
                         self.logger.info(f"略過（已完整下載）: {rel_path}")
-                        self._align_local_mode(local_file, remote_stat, rel_path)
+                        self._align_local_mode(local_file, local_stat, remote_stat, rel_path)
                         self._manifest[rel_path] = {"size": remote_size, "mtime": remote_mtime}
                         self._manifest_dirty = True  # 收尾一次寫回，見 _flush_manifest
                         return "skipped"
