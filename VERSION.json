@@ -1,7 +1,7 @@
 {
-  "version": "0.10.5",
-  "date": "2026-09-01",
-  "notes": "權限對齊：內容未變更但兩端 mode 不同時只補 chmod、不重傳（記為 MODE_ALIGNED），修掉略過分支永遠不套用權限導致的漂移",
+  "version": "0.11.0",
+  "date": "2026-09-04",
+  "notes": "deploy_offline.sh 階段 A4b:新增 stage_unattended_boot,呼叫 scheduler 的兩支一次性 root 設定器(install_udisks_mount_policy.sh 資料碟掛載授權、install_gdm_autologin.sh GDM 自動登入)。在這之前兩支都只能人工執行,等於新機部署完仍是壞的,而壞的方式沒有任何錯誤訊息。兩題都預設 Y —— 兩者都是船機的應然狀態而非選項,autologin=false 的機台是安裝失誤不是保安決定。兩支離開碼契約相同(0/1/2/3/4/5/6)故共用一套判讀;polkit 的 --status 需 root,先試 sudo -n 沿用前面階段的憑證。找不到安裝器、非互動終端、前提不成立一律略過並印出手動指令,不中斷部署;總結措辭一律是「已安裝,待重開機驗證」",
   "stamp_exclude": [
     "*.whl"
   ]
