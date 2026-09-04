@@ -18,6 +18,10 @@
 #      4) install_docker_group.sh → 把使用者加進 docker 群組(需密碼)。web 平台
 #         (start_web_docker.sh)跑在 systemd user session 裡、無法輸入 sudo 密碼,
 #         所以「免 sudo 使用 docker」是它能開機自啟的前提。群組變更需重開機才生效。
+#     4b) 無人值守開機的兩個前提(兩支都需密碼,兩支都要重開機才驗得出來):
+#         install_udisks_mount_policy.sh → 資料碟掛載的 polkit 授權(預設 Y)
+#         install_gdm_autologin.sh       → GDM 自動登入(**預設 N**,見該函式的註解)
+#         兩支修的是同一件事的兩半:開機那一刻沒有人登入圖形桌面。
 #      5~7) 以下三步由**同一個問題**一併決定(它們是一個概念單位:週期排程與 ipc 接管):
 #         5) install_timers.sh      → 週期排程 timer（依實體 IPC 篩選）
 #         6) sudoers 白名單         → reboot / teamviewer 需要(這一步要輸入一次密碼)
@@ -917,6 +921,158 @@ stage_docker_group() {
   fi
 }
 
+# --- 無人值守開機的兩個前提（scheduler 的兩支一次性 root 設定器）------------
+# 這兩支修的是同一件事的兩半:**開機那一刻沒有人登入圖形桌面**。同一份程式碼在
+# autologin=true 的機台上會成功、在 false 的機台上每次都失敗,而那個逐機設定從來沒有被
+# 宣告過(CLINK/WHA02=true、WH332=false,三台的來源與交付時序沒有紀錄)。
+#
+#   * 資料碟掛載 —— 這顆碟 HintSystem=true,polkit 套用的是
+#     org.freedesktop.udisks2.filesystem-mount-**system**,三條路預設全要 admin 認證。
+#     於是掛載只在「開機那一刻該使用者剛好有一個帶認證代理的圖形 session」時才成功。
+#     install_udisks_mount_policy.sh 補一份本機授權覆蓋把那個前提移除(WH332 實機驗收過)。
+#   * 實體桌面 —— 沒有 autologin 的機台開機後 :0 上坐的是 GDM greeter(身分是 gdm,不是
+#     使用者),使用者根本還沒有 X display。WH335 實測開機 07:11、圖形登入 07:44,中間
+#     33 分鐘任何要開視窗的服務都會秒退。install_gdm_autologin.sh 設定 GDM 自動登入。
+#
+# 證據:scheduler/docs/nvme-boot-mount-incident.md §1/§2.1/§4、
+#       scheduler/docs/ecdis-x-display-without-autologin.md。
+#
+# 【兩題的預設值刻意不同,那不是筆誤】
+#   * polkit 授權預設 **Y**:它只放行「掛這顆碟」這一個 action 給這一個帳號,沒有其他曝險;
+#     少了它,radar / ecdis / wave / web 會在下一次開機一起死,而且沒有任何錯誤訊息。
+#   * 自動登入預設 **N**:它會讓**主控台開機即進入一個沒有上鎖的桌面**。在駕駛台那多半
+#     正是本意,但那是一個逐船的保安決定 —— 部署腳本不該替船東預設同意。要開的人按一個
+#     Y 就好;被預設開啟的人可能一整年都不會發現。
+#
+# 【這一段只負責裝,絕不宣告修好了】兩支修的東西**都只有重開機才驗得出來**,而部署流程
+# 最後那一次啟動不是重開機。所以總結只會說「已安裝,待重開機驗證」。
+#
+# 兩支的離開碼契約相同(刻意對齊,這裡才能用同一套 case 判讀):
+#   0 就緒/成功  1 尚未就緒或失敗  2 參數錯誤  3 需要 root  4 前提不成立  5 沙盒守衛
+#   6 無從判定(讀不到 → **不代表沒裝**)
+# 這一步失敗不中斷部署:它修的是「下一次開機」,不是這一次部署。
+stage_unattended_boot() {
+  MOUNT_POLICY_INSTALLER="${SHARE_DIR}/scheduler/install_udisks_mount_policy.sh"
+  GDM_AUTOLOGIN_INSTALLER="${SHARE_DIR}/scheduler/install_gdm_autologin.sh"
+  MOUNT_POLICY_STATUS="未執行"
+  GDM_AUTOLOGIN_STATUS="未執行"
+
+  echo ""
+  info "檢查無人值守開機的兩個前提（資料碟掛載授權 / GDM 自動登入）..."
+
+  # 兩支 --status 需要的權限不同:polkit 那份住在 0700 的 50-local.d，一般使用者連列都列
+  # 不出來（它會誠實回 6「無從判定」而不是「沒安裝」——「看不到」不等於「沒有」）;
+  # GDM 的 custom.conf 是 0644，一般使用者就讀得到。所以先試 sudo -n（前面幾個階段多半
+  # 已經把憑證快取住了），拿不到就退回一般身分，讓安裝器自己去回報無從判定。
+  unattended_probe() {  # $1 = 安裝器路徑；結果留在全域 RC
+    if sudo -n true 2>/dev/null; then
+      run_rc sudo -n bash "$1" --status
+    else
+      run_rc bash "$1" --status
+    fi
+  }
+
+  # ---- (1) 資料碟掛載的 polkit 授權 ----
+  if [ ! -f "$MOUNT_POLICY_INSTALLER" ]; then
+    warn "找不到 $MOUNT_POLICY_INSTALLER ，略過資料碟掛載授權。"
+    warn "這台的資料碟將繼續依賴「開機那一刻有圖形登入」——autologin=false 的機台每次開機都掛不上。"
+    MOUNT_POLICY_STATUS="略過（找不到安裝腳本）"
+  else
+    unattended_probe "$MOUNT_POLICY_INSTALLER" >/dev/null 2>&1
+    MP_RC="$RC"
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+      case "$MP_RC" in
+        0) MOUNT_POLICY_STATUS="已就緒" ;;
+        4) MOUNT_POLICY_STATUS="前提不成立（polkit 0.106+ 或帳號問題）$DRYRUN_NOTE" ;;
+        6) MOUNT_POLICY_STATUS="無從判定（讀不到 50-local.d）$DRYRUN_NOTE" ;;
+        *) MOUNT_POLICY_STATUS="尚未安裝$DRYRUN_NOTE" ;;
+      esac
+    elif [ "$MP_RC" -eq 0 ]; then
+      ok "資料碟掛載授權已就緒。"
+      MOUNT_POLICY_STATUS="已就緒"
+    elif [ "$MP_RC" -eq 4 ]; then
+      warn "資料碟掛載授權的前提不成立（polkit 0.106+ 或帳號問題）——安裝器會說明原因:"
+      warn "  bash $MOUNT_POLICY_INSTALLER --status"
+      MOUNT_POLICY_STATUS="前提不成立（未安裝）"
+    elif [ ! -t 0 ]; then
+      warn "非互動終端機，略過資料碟掛載授權（需 sudo）。"
+      warn "如需安裝，請手動執行:sudo bash $MOUNT_POLICY_INSTALLER"
+      MOUNT_POLICY_STATUS="略過（非互動終端機）"
+    elif ask_yn "  安裝資料碟掛載的 polkit 授權？不裝的話,autologin=false 的機台每次開機都掛不上碟（需輸入一次密碼）[Y/n] " Y; then
+      mutating "安裝資料碟掛載的 polkit 授權"
+      run_rc sudo bash "$MOUNT_POLICY_INSTALLER"
+      MP_RC="$RC"
+      case "$MP_RC" in
+        0) ok "資料碟掛載授權已安裝——**要重開機後看開機快照才算驗證過**。"
+           MOUNT_POLICY_STATUS="已安裝，待重開機驗證" ;;
+        4) warn "前提不成立，未安裝（安裝器已說明原因）。"
+           MOUNT_POLICY_STATUS="前提不成立（未安裝）" ;;
+        *) warn "資料碟掛載授權安裝失敗（exit=$MP_RC）。"
+           MOUNT_POLICY_STATUS="失敗（exit=$MP_RC）" ;;
+      esac
+    else
+      info "略過資料碟掛載授權。日後可執行:sudo bash $MOUNT_POLICY_INSTALLER"
+      warn "在那之前,這台的資料碟仍依賴「開機那一刻有帶認證代理的圖形 session」。"
+      MOUNT_POLICY_STATUS="使用者略過"
+    fi
+  fi
+
+  # ---- (2) GDM 自動登入 ----
+  echo ""
+  if [ ! -f "$GDM_AUTOLOGIN_INSTALLER" ]; then
+    warn "找不到 $GDM_AUTOLOGIN_INSTALLER ，略過 GDM 自動登入設定。"
+    warn "舊的離線包不帶這一支;這台開機後不會有使用者的圖形 session。"
+    GDM_AUTOLOGIN_STATUS="略過（找不到安裝腳本）"
+  else
+    # 這一支的 --status 不需要 root（custom.conf 是 0644），所以直接跑,不去動 sudo 憑證。
+    run_rc bash "$GDM_AUTOLOGIN_INSTALLER" --status >/dev/null 2>&1
+    GA_RC="$RC"
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+      case "$GA_RC" in
+        0) GDM_AUTOLOGIN_STATUS="已開啟" ;;
+        4) GDM_AUTOLOGIN_STATUS="前提不成立（不是 GDM 或設定檔異常）$DRYRUN_NOTE" ;;
+        6) GDM_AUTOLOGIN_STATUS="無從判定（讀不到 custom.conf）$DRYRUN_NOTE" ;;
+        *) GDM_AUTOLOGIN_STATUS="未開啟$DRYRUN_NOTE" ;;
+      esac
+    elif [ "$GA_RC" -eq 0 ]; then
+      ok "GDM 自動登入已開啟。"
+      GDM_AUTOLOGIN_STATUS="已開啟"
+    elif [ "$GA_RC" -eq 4 ]; then
+      warn "GDM 自動登入的前提不成立（這台可能不是 GDM,或設定檔沒有 [daemon] 段）:"
+      warn "  bash $GDM_AUTOLOGIN_INSTALLER --status"
+      GDM_AUTOLOGIN_STATUS="前提不成立（未設定）"
+    elif [ ! -t 0 ]; then
+      warn "非互動終端機，略過 GDM 自動登入設定（需 sudo）。"
+      warn "如需設定，請手動執行:sudo bash $GDM_AUTOLOGIN_INSTALLER"
+      GDM_AUTOLOGIN_STATUS="略過（非互動終端機）"
+    else
+      # 【為什麼這一題預設 N】見本函式檔頭。問法也刻意把後果寫在題目裡,而不是只問
+      # 「要不要開自動登入」——沒有人會在部署到一半時去查那代表什麼。
+      warn "沒有自動登入時,開機後 :0 上坐的是 GDM greeter,使用者要手動登入才會有桌面;"
+      warn "在那之前任何要開視窗的服務都會秒退（WH335 實測那段是 33 分鐘）。"
+      warn "但開啟它代表**主控台開機即進入一個沒有上鎖的桌面** —— 這是逐船的保安決定。"
+      if ask_yn "  開啟 GDM 自動登入（$(id -un)）？[y/N] " N; then
+        mutating "設定 GDM 自動登入"
+        run_rc sudo bash "$GDM_AUTOLOGIN_INSTALLER"
+        GA_RC="$RC"
+        case "$GA_RC" in
+          0) ok "GDM 自動登入已設定——**下次開機生效**（本腳本刻意不重啟 gdm3,那會殺掉當下的圖形 session）。"
+             GDM_AUTOLOGIN_STATUS="已設定，待重開機生效" ;;
+          4) warn "前提不成立，未設定（安裝器已說明原因）。"
+             GDM_AUTOLOGIN_STATUS="前提不成立（未設定）" ;;
+          *) warn "GDM 自動登入設定失敗（exit=$GA_RC）。"
+             GDM_AUTOLOGIN_STATUS="失敗（exit=$GA_RC）" ;;
+        esac
+      else
+        info "略過 GDM 自動登入。日後可執行:sudo bash $GDM_AUTOLOGIN_INSTALLER --user $(id -un)"
+        warn "在那之前,這台開機後不會有使用者的圖形 session（setup_display 會短等就 exit 0,"
+        warn "那是預期行為,不是開機失敗）。"
+        GDM_AUTOLOGIN_STATUS="使用者略過"
+      fi
+    fi
+  fi
+}
+
 # --- 週期排程設定（scheduler/install_timers.sh + sudoers 白名單） ----------
 # 與開機自動執行同屬「需使用者留意的一次性設定」：
 #   1) install_timers.sh 佈署/啟用 systemd user timer（純 user 層，免 root）。
@@ -1619,6 +1775,8 @@ stage_summary() {
   printf "  clink_* 遷移    ：%s\n" "$MIGRATE_STATUS"
   printf "  docker 群組      ：%s\n" "$DOCKER_GROUP_STATUS"
   printf "  sudo 白名單      ：%s\n" "$SUDOERS_STATUS"
+  printf "  資料碟掛載授權  ：%s\n" "$MOUNT_POLICY_STATUS"
+  printf "  GDM 自動登入    ：%s\n" "$GDM_AUTOLOGIN_STATUS"
   printf "  tmux            ：%s\n" "$TMUX_STATUS"
   printf "  照片同步金鑰    ：%s\n" "$SSH_KEY_STATUS"
   [ "$RUN_HEALTH" -eq 1 ] && printf "  健康檢查        ：%s\n" \
@@ -1719,6 +1877,7 @@ main() {
   stage_autostart                    # A2 nssms-boot.service + linger
   stage_clink_migration              # A3 舊 clink_* —— **必須早於 A7，否則撞 port**
   stage_docker_group                 # A4 docker 群組（web 平台開機自啟的前提）
+  stage_unattended_boot              # A4b 無人值守開機的兩個前提（掛載授權 / 自動登入）
   stage_scheduler_units              # A5/A6/A7 timer + sudoers + 常駐服務
   stage_tmux                         # A8 tmux 離線補齊 —— **必須早於 A10**（見該函式）
   stage_ssh_key                      # A9 照片同步的 SSH 金鑰（僅實體 IPC-2）
