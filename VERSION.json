@@ -1,7 +1,7 @@
 {
-  "version": "0.11.0",
+  "version": "0.12.0",
   "date": "2026-09-04",
-  "notes": "deploy_offline.sh 階段 A4b:新增 stage_unattended_boot,呼叫 scheduler 的兩支一次性 root 設定器(install_udisks_mount_policy.sh 資料碟掛載授權、install_gdm_autologin.sh GDM 自動登入)。在這之前兩支都只能人工執行,等於新機部署完仍是壞的,而壞的方式沒有任何錯誤訊息。兩題都預設 Y —— 兩者都是船機的應然狀態而非選項,autologin=false 的機台是安裝失誤不是保安決定。兩支離開碼契約相同(0/1/2/3/4/5/6)故共用一套判讀;polkit 的 --status 需 root,先試 sudo -n 沿用前面階段的憑證。找不到安裝器、非互動終端、前提不成立一律略過並印出手動指令,不中斷部署;總結措辭一律是「已安裝,待重開機驗證」",
+  "notes": "--check-only 救活成真正的狀態報告器,並新增交船狀態段(stage_deployment_state)。6668f85 曾在 preflight 加一個 exit 0,於是 --check-only 只走完 preflight 就回家,階段 A 那 15 處「只回報、不動作」的分支從此是從沒被執行過的死碼;拿掉早退、並補上 stage_tmux 缺的那一道唯讀分支(沒有它會在 mutating 當場中止)。交船狀態把事實分成「現在就能斷言(設定層)」與「只有重開機才知道(行為層)」兩欄:部署當下操作者正登入著圖形桌面,polkit 的 allow_active 直接放行,一台每次開機都掛不上的機器看起來完全正常。開機快照的可信度改看快照自己標記的模式(只有 boot-* 算數,warm-only/reconcile 帶著同樣的假陽性),不看檔案 mtime。設定層判決委派給 nvme-mount-probe 與 install_gdm_autologin --status,完整狀態面板委派給 dashboard --once,不重寫第二份判定",
   "stamp_exclude": [
     "*.whl"
   ]

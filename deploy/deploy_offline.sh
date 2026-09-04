@@ -454,9 +454,13 @@ banner_and_preflight() {
   fi
   ok "雙平台 tmux 離線資產 preflight 通過。"
 
+  # 【--check-only 刻意不在這裡結束】6668f85(Bionic/Jammy 的 tmux 離線安裝)曾在這裡加一個
+  # exit 0,於是 --check-only 只走完 preflight 就回家 —— 而階段 A 那 15 處「只回報、不動作」
+  # 的分支從此變成**從沒被執行過的死碼**,`--check-only` 也答不出這台機器現在是什麼狀態。
+  # 原設計的結束點在 stage_wheelhouse_and_venv(wheel 校驗之後),那才是「只驗證,不安裝」
+  # 的完整範圍。這裡只印一行,讓它繼續往下走。
   if [ "$CHECK_ONLY" -eq 1 ]; then
-    ok "--check-only 完成：未執行安裝或其他持久變更。"
-    exit 0
+    info "--check-only：preflight 通過;繼續以唯讀方式巡一遍一次性設定的現況。"
   fi
 
 }
@@ -1247,7 +1251,14 @@ stage_tmux() {
     TMUX_STATUS="已就緒"
     return
   fi
-  # main 的 --check-only 已在全域 preflight 結束；以下只可能是正式部署。
+  # 【這裡以前假設「只可能是正式部署」】那個假設來自 --check-only 曾在 preflight 就結束;
+  # 早退拿掉之後,--check-only 會走到這裡,而下面是安裝路徑(ask_yn → mutating → dpkg)。
+  # 沒有這道分支,--check-only 會在 mutating 當場中止並印「內部錯誤」。
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "本機的 tmux **不可用**（exit=$TMUX_RC）—— 所有 session 型專案都會起不來。$DRYRUN_NOTE"
+    TMUX_STATUS="不可用（exit=$TMUX_RC）$DRYRUN_NOTE"
+    return
+  fi
   warn "本機的 tmux 不可用 —— 所有 session 型專案（shm / radar / wave / ecdis / flag）都起不來。"
   if [ "$TMUX_RC" -ne 5 ]; then
     err "tmux 狀態或離線資產異常（exit=$TMUX_RC），停止部署。"
@@ -1474,6 +1485,7 @@ stage_wheelhouse_and_venv() {
 
   if [ "$CHECK_ONLY" -eq 1 ]; then
     ok "--check-only 完成：環境與 wheel 皆就緒，未執行安裝。"
+    stage_deployment_state
     exit 0
   fi
 
@@ -1863,6 +1875,124 @@ stage_summary() {
   echo "==========================================================="
 }
 
+# --- 交船狀態（--check-only 與正式部署收尾共用）----------------------------
+# 【為什麼要獨立這一段,而不是把兩行塞進部署總結】部署總結回答的是「這次跑了什麼」——
+# 每一欄都是本次執行的動作結果(已安裝 / 使用者略過 / 失敗)。這一段回答的是另一個問題:
+# **這台機器現在是什麼狀態,以及哪些事現在還答不出來。**
+#
+# 【部署當下量到的東西會系統性地騙你 —— 這是本段存在的全部理由】
+#   * 資料碟:收尾的完整啟動流程會呼叫 reboot_launcher.sh 的 mount_nvme(),而此刻操作者
+#     **正登入著圖形桌面**,polkit 的 allow_active 路徑直接放行 → 碟掛得起來、findmnt 有
+#     東西。一台每次開機都掛不上的機器,在部署當下看起來完全正常。而且 mount-system 是
+#     auth_admin_**keep**:人輸過一次密碼後,同一個 session 問都是 rc=0,那個留存不跨重開機。
+#   * 自動登入:改動要下次 GDM 啟動才生效,而此刻已經有一個 session(操作者自己的)——
+#     「有開」和「沒開」的機器在 loginctl 上長得一模一樣。
+#
+# 所以這一段把事實分成兩欄:**現在就能斷言的(設定層)** 與 **只有重開機才知道的(行為層)**,
+# 並且絕不把後者說成前者。設定層之所以可信,是因為判決委派給
+# scheduler/tool/nvme-mount-probe(它以 root 跑時改用 runuser、以目標使用者且無 session 的
+# 處境評估 pkcheck,那才等同開機處境),以及 install_gdm_autologin.sh --status(它讀的就是
+# GDM 真正會解析的那個值)。這裡**不重寫第二份判定** —— 兩份遲早漂移,而漂移那天沒人看得出來。
+stage_deployment_state() {
+  local sched="${SHARE_DIR}/scheduler"
+  local mp="$sched/install_udisks_mount_policy.sh"
+  local ga="$sched/install_gdm_autologin.sh"
+  local snap="$sched/logs/nvme_mount_probe.log"
+
+  echo ""
+  echo "── 交船狀態 ──"
+  echo ""
+  echo "【現在就能斷言】設定層 —— 這一刻讀得到的事實"
+
+  # 資料碟掛載授權。--status 需要 root 才讀得到 50-local.d;讀不到時它回 6「無從判定」
+  # 而不是「沒安裝」——「看不到」不等於「沒有」,那是事故報告 §7 一再犯的錯。
+  if [ ! -f "$mp" ]; then
+    printf "  資料碟掛載授權    ：%s\n" "**無從判定**（這個離線包沒有 install_udisks_mount_policy.sh）"
+  else
+    if sudo -n true 2>/dev/null; then run_rc sudo -n bash "$mp" --status >/dev/null 2>&1
+    else                              run_rc bash "$mp" --status >/dev/null 2>&1; fi
+    case "$RC" in
+      0) printf "  資料碟掛載授權    ：%s\n" "已就緒（$(id -un) 可無人值守掛載）" ;;
+      4) printf "  資料碟掛載授權    ：%s\n" "**前提不成立**（polkit 0.106+ 或帳號問題）—— 跑 --status 看原因" ;;
+      6) printf "  資料碟掛載授權    ：%s\n" "**無從判定**（讀不到 50-local.d,需 root）—— 不代表沒裝" ;;
+      *) printf "  資料碟掛載授權    ：%s\n" "**尚未就緒** —— 這台的碟仍依賴開機那一刻有圖形登入" ;;
+    esac
+  fi
+
+  # GDM 自動登入。custom.conf 是 0644,不需要 root。
+  if [ ! -f "$ga" ]; then
+    printf "  GDM 自動登入      ：%s\n" "**無從判定**（這個離線包沒有 install_gdm_autologin.sh）"
+  else
+    run_rc bash "$ga" --status >/dev/null 2>&1
+    case "$RC" in
+      0) printf "  GDM 自動登入      ：%s\n" "已開啟" ;;
+      4) printf "  GDM 自動登入      ：%s\n" "**前提不成立**（不是 GDM,或設定檔異常）" ;;
+      6) printf "  GDM 自動登入      ：%s\n" "**無從判定**（讀不到 custom.conf）" ;;
+      *) printf "  GDM 自動登入      ：%s\n" "**沒有開** —— 全船隊都該是開的,這通常是安裝失誤" ;;
+    esac
+  fi
+
+  echo ""
+  echo "【要重開機才知道】行為層 —— **部署當下量不到,量到的會騙你**（理由見本段原始碼註解）"
+
+  # 【開機快照的關鍵不是「有沒有」,是「它是誰寫的」】mount_nvme() 在 boot / reconcile /
+  # warm-only 三種模式都會呼叫探針,而快照**自己標記了模式與開機後經過秒數**
+  # (「──── <時間> nvme-snapshot (boot-before) ────」「開機後經過 N 秒」)。
+  # 只有 boot-* 的那一份才是開機證據:warm-only 與 reconcile 是在有人登入著的時候跑的,
+  # 它們的 rc=0 帶著跟部署當下一模一樣的假陽性。用檔案 mtime 判斷會直接踩進這個坑 ——
+  # 一份六天前開機、昨晚 warm 跑出來的快照,mtime 比開機時間新,看起來像「本次開機」。
+  if [ ! -r "$snap" ]; then
+    printf "  開機時碟掛上了嗎  ：%s\n" "**還沒有任何開機量測** —— 重開機後才會有"
+  else
+    local blk tag up
+    blk="$(awk '/nvme-snapshot \(/ {buf=""} {buf=buf $0 "\n"} END {printf "%s", buf}' "$snap")"
+    tag="$(printf '%s' "$blk" | sed -n 's/.*nvme-snapshot (\([^)]*\)).*/\1/p' | head -1)"
+    up="$(printf '%s'  "$blk" | sed -n 's/^ *開機後經過 *\([0-9]*\).*/\1/p' | head -1)"
+    case "${tag:-?}" in
+      boot-*)
+        if [ -n "$up" ] && [ "$up" -gt 900 ] 2>/dev/null; then
+          printf "  開機時碟掛上了嗎  ：%s\n" "最後一份是 boot 快照,但寫在開機後 $up 秒 —— 存疑,請重開機再看"
+        else
+          printf "  開機時碟掛上了嗎  ：%s\n" "**這是開機證據**（$tag,開機後 ${up:-?} 秒）"
+        fi
+        printf '%s' "$blk" | grep -E '^ *(polkit 判決|findmnt)' | sed 's/^ */      /'
+        ;;
+      *)
+        printf "  開機時碟掛上了嗎  ：%s\n" "**還不知道** —— 最後一份快照是 ${tag:-未知模式},不是開機時寫的"
+        echo   "                      （warm-only / reconcile 是在有人登入著的時候跑的,它的 rc=0"
+        echo   "                        帶著跟部署當下一模一樣的假陽性。只有 boot-* 那份算數。）"
+        ;;
+    esac
+  fi
+  printf "  使用者的 X display：%s\n" "**只有下次開機後才算數** —— 現在這個 session 是人手動登入的,"
+  echo   "                      在「有開」和「沒開」自動登入的機器上長得一模一樣。"
+
+  echo ""
+  echo "  重開機後用這一行拿到行為層的答案（兩項一次）:"
+  echo "    bash ${SHARE_DIR}/sftp_transfer/deploy/deploy_offline.sh --check-only"
+
+  # 【擴充範圍由操作者決定,而且只在 --check-only 問】正式部署的收尾在「不再需要輸入」
+  # 之後,操作者可能已經離開終端機 —— 在那裡問問題會讓他回來才發現卡著。
+  if [ "$CHECK_ONLY" -eq 1 ] && [ -t 0 ]; then
+    echo ""
+    if ask_yn "  要不要一併跑完整狀態面板（專案 / systemd 單元 / 版本 / 整體）？[Y/n] " Y; then
+      echo ""
+      # 委派給 scheduler 的 dashboard --once:它是唯讀契約(不接受任何動作參數),而且判定
+      # 住在 probes/ —— 在這裡自己判一次專案死活,等於複製一份會腐爛的判定邏輯。
+      if [ -d "$sched/dashboard" ]; then
+        # 換目錄關在子 shell 裡(dashboard 要以 scheduler 為 cwd 才 import 得到),離開碼
+        # 靠 || 帶出來 —— run_rc 設的 RC 留在子 shell 裡,外面讀不到。
+        local dash_rc=0
+        ( cd "$sched" && timeout 120 python3 -m dashboard.dashboard --once ) || dash_rc=$?
+        [ "$dash_rc" -ne 0 ] && warn "狀態面板回 $dash_rc（它是唯讀的,失敗不影響本機狀態）。"
+      else
+        warn "找不到 $sched/dashboard —— 這個離線包沒帶狀態面板。"
+      fi
+    fi
+  fi
+  echo ""
+}
+
 # --- 主流程 ----------------------------------------------------------------
 # 這個函式就是檔頭那份 A/B/C 大綱本身。原本它是一支 1100 行的直線腳本，流程只存在於
 # 檔頭的註解裡 —— 而註解會漂移（A4~A7 的編號就漂過一次），main() 不會跟自己漂移。
@@ -1894,7 +2024,9 @@ main() {
   # 這行宣告從此變成可執行的約束:之後任何提示都會讓 ask_yn 當場中止（見它的註解）。
   # 原本這條不變式只靠 scheduler/tests/test_first_deploy.sh 比對「檔案裡最後一個讀取提示
   # 的行號」來守,那是文字層面的近似;提示全部改走 ask_yn 之後行號已經守不住,改由執行期把關。
-  NO_MORE_INPUT=1
+  # 【--check-only 不宣告這件事】它沒有 venv 那段無人干預的長流程,操作者本來就在鍵盤前;
+  # 而交船狀態那一段要問他「要不要一併跑完整狀態面板」。宣告了就會被 ask_yn 當場擋下。
+  [ "$CHECK_ONLY" -eq 1 ] || NO_MORE_INPUT=1
 
   # ---- 階段 B：sftp_transfer 專屬 venv（離線、無人干預）----
   stage_wheelhouse_and_venv
@@ -1905,6 +2037,7 @@ main() {
   stage_health_check                 # 也刻意在啟動之後（否則巡檢的 tmux 段沒有意義）
   stage_automation_check
   stage_summary
+  stage_deployment_state             # 這次跑了什麼(總結)之外,這台現在是什麼狀態
 
   # 部署本身成功即回傳 0；健康檢查結果另以訊息呈現，不影響部署離開碼。
   exit 0
