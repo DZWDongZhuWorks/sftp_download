@@ -20,7 +20,7 @@
 #         所以「免 sudo 使用 docker」是它能開機自啟的前提。群組變更需重開機才生效。
 #     4b) 無人值守開機的兩個前提(兩支都需密碼,兩支都要重開機才驗得出來):
 #         install_udisks_mount_policy.sh → 資料碟掛載的 polkit 授權(預設 Y)
-#         install_gdm_autologin.sh       → GDM 自動登入(**預設 N**,見該函式的註解)
+#         install_gdm_autologin.sh       → GDM 自動登入(預設 Y;全船隊都該是開的)
 #         兩支修的是同一件事的兩半:開機那一刻沒有人登入圖形桌面。
 #      5~7) 以下三步由**同一個問題**一併決定(它們是一個概念單位:週期排程與 ipc 接管):
 #         5) install_timers.sh      → 週期排程 timer（依實體 IPC 篩選）
@@ -937,12 +937,15 @@ stage_docker_group() {
 # 證據:scheduler/docs/nvme-boot-mount-incident.md §1/§2.1/§4、
 #       scheduler/docs/ecdis-x-display-without-autologin.md。
 #
-# 【兩題的預設值刻意不同,那不是筆誤】
-#   * polkit 授權預設 **Y**:它只放行「掛這顆碟」這一個 action 給這一個帳號,沒有其他曝險;
-#     少了它,radar / ecdis / wave / web 會在下一次開機一起死,而且沒有任何錯誤訊息。
-#   * 自動登入預設 **N**:它會讓**主控台開機即進入一個沒有上鎖的桌面**。在駕駛台那多半
-#     正是本意,但那是一個逐船的保安決定 —— 部署腳本不該替船東預設同意。要開的人按一個
-#     Y 就好;被預設開啟的人可能一整年都不會發現。
+# 【兩題都預設 Y,因為兩者都是船機的應然狀態,不是選項】
+#   * polkit 授權:它只放行「掛這顆碟」這一個 action 給這一個帳號,沒有其他曝險;少了它,
+#     radar / ecdis / wave / web 會在下一次開機一起死,而且沒有任何錯誤訊息。
+#   * 自動登入:**全船隊的機器都應該是開的**。這台是駕駛台的操作終端,開機後要自己進到
+#     桌面把該顯示的東西顯示出來 —— 沒有人會在開機後跑去鍵盤前打密碼。實測 false 的機台
+#     (WH332)不是誰做過的保安決定,而是**安裝時的設定失誤**:那個逐機漂移從來沒有被
+#     宣告過,也沒有人負責(CLINK/WHA02=true、WH332=false,三台的來源與交付時序沒有紀錄,
+#     見事故報告 §2.1「另一項」)。它一關,後續一整排要開視窗的服務都起不來。
+#     所以這一題的提示不是「要不要開」,而是「偵測到這台沒開 —— 這是裝錯了,現在補」。
 #
 # 【這一段只負責裝,絕不宣告修好了】兩支修的東西**都只有重開機才驗得出來**,而部署流程
 # 最後那一次啟動不是重開機。所以總結只會說「已安裝,待重開機驗證」。
@@ -1021,7 +1024,8 @@ stage_unattended_boot() {
   echo ""
   if [ ! -f "$GDM_AUTOLOGIN_INSTALLER" ]; then
     warn "找不到 $GDM_AUTOLOGIN_INSTALLER ，略過 GDM 自動登入設定。"
-    warn "舊的離線包不帶這一支;這台開機後不會有使用者的圖形 session。"
+    warn "舊的離線包不帶這一支;若這台沒開自動登入,開機後不會有使用者的圖形 session。"
+    warn "請以較新的離線包重跑,或人工設定 /etc/gdm3/custom.conf 的 AutomaticLoginEnable=true。"
     GDM_AUTOLOGIN_STATUS="略過（找不到安裝腳本）"
   else
     # 這一支的 --status 不需要 root（custom.conf 是 0644），所以直接跑,不去動 sudo 憑證。
@@ -1046,12 +1050,13 @@ stage_unattended_boot() {
       warn "如需設定，請手動執行:sudo bash $GDM_AUTOLOGIN_INSTALLER"
       GDM_AUTOLOGIN_STATUS="略過（非互動終端機）"
     else
-      # 【為什麼這一題預設 N】見本函式檔頭。問法也刻意把後果寫在題目裡,而不是只問
-      # 「要不要開自動登入」——沒有人會在部署到一半時去查那代表什麼。
-      warn "沒有自動登入時,開機後 :0 上坐的是 GDM greeter,使用者要手動登入才會有桌面;"
-      warn "在那之前任何要開視窗的服務都會秒退（WH335 實測那段是 33 分鐘）。"
-      warn "但開啟它代表**主控台開機即進入一個沒有上鎖的桌面** —— 這是逐船的保安決定。"
-      if ask_yn "  開啟 GDM 自動登入（$(id -un)）？[y/N] " N; then
+      # 【這一題的問法】見本函式檔頭:autologin=false 不是一個選項,是一台裝錯的機器。
+      # 所以提示先說「這台沒開」是異常,再問要不要補 —— 而不是中性地問「要不要開」,
+      # 那會讓操作者以為兩個答案一樣好。
+      warn "這台**沒有開自動登入** —— 全船隊的機器都應該是開的,這通常是安裝時的設定失誤。"
+      warn "沒開的後果:開機後 :0 上坐的是 GDM greeter,使用者的桌面根本不存在,"
+      warn "在有人手動登入之前,任何要開視窗的服務都會秒退（WH335 實測那段是 33 分鐘）。"
+      if ask_yn "  現在補上 GDM 自動登入（$(id -un)）？（需輸入一次密碼）[Y/n] " Y; then
         mutating "設定 GDM 自動登入"
         run_rc sudo bash "$GDM_AUTOLOGIN_INSTALLER"
         GA_RC="$RC"
@@ -1065,9 +1070,10 @@ stage_unattended_boot() {
         esac
       else
         info "略過 GDM 自動登入。日後可執行:sudo bash $GDM_AUTOLOGIN_INSTALLER --user $(id -un)"
-        warn "在那之前,這台開機後不會有使用者的圖形 session（setup_display 會短等就 exit 0,"
-        warn "那是預期行為,不是開機失敗）。"
-        GDM_AUTOLOGIN_STATUS="使用者略過"
+        warn "**這台會以一個已知不完整的狀態交船**:開機後不會有使用者的圖形 session,"
+        warn "要開視窗的服務一律起不來(setup_display 會短等就 exit 0 —— 那是它的預期行為,"
+        warn "不是開機失敗,所以 log 上也不會有紅字告訴你這件事)。"
+        GDM_AUTOLOGIN_STATUS="**使用者略過（這台會缺自動登入）**"
       fi
     fi
   fi
