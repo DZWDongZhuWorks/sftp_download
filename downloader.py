@@ -242,7 +242,7 @@ class SFTPBase:
         self.resume = resume
         self.wait_for_network = wait_for_network
         self.recursive = recursive  # True：處理所有子資料夾（多層）；False：只處理該路徑下的檔案（單層）
-        self.ignore_file = ignore_file  # 忽略設定檔路徑（格式同 .gitignore），None 或檔案不存在代表無需忽略
+        self.ignore_file = ignore_file  # 忽略設定檔路徑（格式同 .gitignore），None 代表無需忽略；指到不存在的檔會警告
         self.retry_count = retry_count  # None 或 <= 0 代表無限次重試
         self.retry_delay = retry_delay
         self.upload_log = upload_log
@@ -389,13 +389,17 @@ class SFTPBase:
             self.client = None
 
     def _load_ignore_spec(self):
-        """讀取「忽略設定檔」（格式同 .gitignore）。未設定或檔案不存在代表無需忽略；
-        格式錯誤的規則逐行略過並記錄警告，其餘正確的規則仍照常生效。"""
+        """讀取「忽略設定檔」（格式同 .gitignore）。未設定代表無需忽略；設定了卻找不到
+        檔會警告後不忽略任何檔案；格式錯誤的規則逐行略過並記錄警告，其餘正確的規則
+        仍照常生效。"""
         if not self.ignore_file:
             return None
         path = Path(self.ignore_file)
         if not path.exists():
-            self.logger.info(diagnostic_message(
+            # 用 warning 而非 info:「刻意不忽略」走的是上面那條 return None(ignore_file
+            # 沒設定)。走到這裡表示有人寫了路徑卻找不到檔 —— 必然是設定錯字或漏放檔案,
+            # 而後果是該排除的東西全被靜默傳出去(config/ 不進 git,沒有別的機制會抓到)。
+            self.logger.warning(diagnostic_message(
                 "IGNORE_FILE_MISSING",
                 f"忽略設定檔不存在，不忽略任何檔案: {path}",
                 path=path,

@@ -1,7 +1,7 @@
 {
-  "version": "0.13.0",
-  "date": "2026-09-08",
-  "notes": "新增 script/run_share_ipc3_download.sh:IPC-3 的 share 下載入口(IPC3_share_download_settings.json → STANDARD/share-IPC3)。與既有的 run_share_download.sh 是同一個形狀,差別只在遠端路徑 —— 兩台要的東西不一樣:IPC-3 需要的是 alarm_controller 與 button(由 scheduler 的 nssms-alarm-controller-ipc3 / nssms-button-ipc3 兩支常駐 unit 跑),IPC-1 那份 remote_path 涵蓋的是它自己那一套,共用一份設定會讓其中一台拿到另一台的檔案。之所以缺這一支:IPC-3 上那兩支是 systemd 常駐 unit 而不是 tmux session,不出現在 roles.conf 的 kind=session 那一類,於是沒有任何專案的 update 相位負責更新它們指到的檔案 ——share 會一直停在交船那一版。呼叫者是 scheduler 的 reboot_script/start_share_ipc3.sh(roles.conf 的 ipc3 / share_ipc3 / oneshot / update 那一列)。設定檔本身不進 git(config/ 整包 gitignored,裡面有密碼),由離線部署送達。run_all_downloads.py 是掃 config/ 的,自動認得,不必改。",
+  "version": "0.14.0",
+  "date": "2026-09-09",
+  "notes": "_load_ignore_spec 找不到 ignore_file 時,診斷事件 IGNORE_FILE_MISSING 從 info 升為 warning。原本的 docstring 寫「未設定或檔案不存在代表無需忽略」—— 那個「或」把 bug 講成了規格:「刻意不忽略」走的是 ignore_file 沒設定時那條 return None,根本到不了 exists() 檢查;走到 exists() 表示有人寫了路徑卻找不到檔,那必然是設定錯字或漏放檔案,零誤報,而後果是該排除的東西全被靜默傳出去。config/ 整包 gitignored(裡面有密碼)、沒有版控、由離線部署與 SFTP OTA 散佈全船隊 —— 不會有 code review 抓到設定檔的錯字,這行 log 是唯一的守門。實際事故:config/ecdis_upload_settings.json 的 ignore_file 寫成 config/ecdis_upload_settings.txt(正確是 config/ecdis_upload_ignore.txt),於是那份 ignore 完全沒生效 —— 155 個 __pycache__/*.pyc、rt_enc_ias/logs/,以及船特定的 rt_enc_ias/config/vessel_basic_info/ 全被推上 STANDARD/ecdis(全船隊基準),而唯一的徵兆是 VERSION.stamp.json 印出 836 MB manifest 的體積警告,沿著那條線才追到錯字。掃過 config/ 全部 20 份設定,ecdis 是唯一一份寫錯的。_load_ignore_spec 定義在 SFTPBase,SFTPDownloader / SFTPUploader / pack_upload._LocalUploadPlanner 三者都繼承,所以上傳、下載、manifest 計算三條路徑同時生效。測試改名為 test_missing_ignore_file_means_no_ignore_and_warns 並加上 levelno == WARNING 的斷言:原本只斷言訊息存在,守門日後被改回 info 也不會有人知道。pytest 562 條全過。",
   "stamp_exclude": [
     "*.whl"
   ]
