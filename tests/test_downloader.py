@@ -360,11 +360,19 @@ class TestIgnoreSpec:
         d = downloader_factory()
         assert d._load_ignore_spec() is None
 
-    def test_missing_ignore_file_means_no_ignore_and_logs_info(self, downloader_factory, tmp_path, caplog):
+    def test_missing_ignore_file_means_no_ignore_and_warns(self, downloader_factory, tmp_path, caplog):
+        """設定了 ignore_file 卻找不到檔，必須是 warning 而不是 info。
+
+        「刻意不忽略」是 ignore_file 沒設定（上一個測試）。走到這條路徑表示有人寫了
+        路徑卻打錯字，而後果是該排除的東西全被靜默傳出去 —— config/ 不進 git，沒有
+        別的機制會抓到，所以這行 log 是唯一的守門。
+        """
         d = downloader_factory(ignore_file=str(tmp_path / "not_exist.txt"))
         with caplog.at_level(logging.INFO):
             assert d._load_ignore_spec() is None
-        assert any("忽略設定檔不存在" in r.message for r in caplog.records)
+        missing = [r for r in caplog.records if "忽略設定檔不存在" in r.message]
+        assert missing
+        assert all(r.levelno == logging.WARNING for r in missing)
 
     def test_invalid_line_is_skipped_with_warning_but_other_rules_still_apply(self, downloader_factory, tmp_path, caplog):
         # "!" 單獨一行是不合法的 gitignore 規則，應跳過並警告；"*.tmp" 仍要生效。
